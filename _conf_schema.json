@@ -1,0 +1,8 @@
+{
+    "admin_ids": {
+        "type": "list",
+        "default": [],
+        "name": "管理员QQ号",
+        "description": "最多3个，用逗号分隔"
+    }
+}
