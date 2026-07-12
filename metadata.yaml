@@ -5,6 +5,7 @@ short_desc: 用户档案管理 — 绑定账号 / 查询档案 / 绑定网站
 version: v1.1.0
 author: 摆烂人生
 repo: https://github.com/balareshe/Filesystem
+logo: logo.png
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.16"
