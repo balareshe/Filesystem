@@ -2,7 +2,25 @@
     "admin_ids": {
         "type": "list",
         "default": [],
-        "name": "管理员QQ号",
-        "description": "最多3个，用逗号分隔"
+        "name": "管理员ID",
+        "description": "管理员账号"
+    },
+    "whois_api_key": {
+        "type": "string",
+        "default": "",
+        "name": "API密钥",
+        "description": "域名信息查询API密钥"
+    },
+    "ssl_api_key": {
+        "type": "string",
+        "default": "",
+        "name": "SSL密钥",
+        "description": "SSL信息查询API密钥"
+    },
+    "icp_api_key": {
+        "type": "string",
+        "default": "",
+        "name": "ICP密钥",
+        "description": "ICP备案查询API密钥"
     }
 }

@@ -17,6 +17,9 @@ class QQProfilePlugin(Star):
         super().__init__(context)
         self.plugin_id = "astrbot_plugin_qq_profile"
         self.admin_ids: list[str] = []
+        self.whois_api_key: str = ""
+        self.ssl_api_key: str = ""
+        self.icp_api_key: str = ""
         if config:
             try:
                 raw = config.get("admin_ids", [])
@@ -26,6 +29,18 @@ class QQProfilePlugin(Star):
                     ]
             except Exception:
                 self.admin_ids = []
+            try:
+                self.whois_api_key = str(config.get("whois_api_key", "") or "").strip()
+            except Exception:
+                self.whois_api_key = ""
+            try:
+                self.ssl_api_key = str(config.get("ssl_api_key", "") or "").strip()
+            except Exception:
+                self.ssl_api_key = ""
+            try:
+                self.icp_api_key = str(config.get("icp_api_key", "") or "").strip()
+            except Exception:
+                self.icp_api_key = ""
 
     # 数据管理（全局统一存储）
 
@@ -137,8 +152,10 @@ class QQProfilePlugin(Star):
             "/更新网站   更新网站信息\n"
             "/解绑网站   解绑网站信息\n"
             "/查询域名   查询域名实时信息\n"
+            "/查询备案   查询域名ICP备案信息\n"
             "/删除档案   删除用户档案(管理)\n"
-            "/评价       对网站进行综合评价\n\n"
+            "/评价       对网站进行综合评价\n"
+            "/排行       查看评价排行榜TOP12\n\n"
             "💡 /绑定网站 支持智能识别\n"
             "发送 /绑定网站 域名 即可自动获取网站名称"
         )
@@ -270,16 +287,6 @@ class QQProfilePlugin(Star):
                 continue
         return None
 
-    @staticmethod
-    def _format_whois_date(d) -> str:
-        if isinstance(d, list):
-            d = d[0] if d else None
-        if d:
-            if hasattr(d, "strftime"):
-                return d.strftime("%Y-%m-%d")
-            return str(d)[:10]
-        return "未知"
-
     async def _fetch_domain_info(self, domain: str) -> dict:
         import aiohttp
         import socket
@@ -322,102 +329,33 @@ class QQProfilePlugin(Star):
         except Exception:
             pass
 
-        merged = {}
-        try:
-            import whois as whois_mod
-            loop = asyncio.get_event_loop()
-
-            tld = domain.split(".")[-1]
-            servers = [None]
-            if tld == "cn":
-                servers += ["whois.cnnic.net.cn", "whois.aliyun.com"]
-            else:
-                servers += ["whois.verisign-grs.com", "whois.godaddy.com", "whois.ionos.com"]
-
-            for srv in servers:
-                try:
-                    w = await asyncio.wait_for(
-                        loop.run_in_executor(None,
-                            lambda s=srv: whois_mod.whois(domain, whois_server=s) if s else whois_mod.whois(domain)),
-                        timeout=8,
-                    )
-                    if w:
-                        for attr in ["registrar", "creation_date", "expiration_date", "updated_date"]:
-                            val = getattr(w, attr, None)
-                            if val and not merged.get(attr):
-                                merged[attr] = val
-                        if merged.get("registrar") and merged.get("creation_date") and merged.get("expiration_date"):
-                            break
-                except Exception:
-                    continue
-
-            if merged:
-                info["registrar"] = merged.get("registrar")
-                info["creation_date"] = self._format_whois_date(merged.get("creation_date"))
-                info["expiration_date"] = self._format_whois_date(merged.get("expiration_date"))
-                info["updated_date"] = self._format_whois_date(merged.get("updated_date"))
-                exp = merged.get("expiration_date")
-                if isinstance(exp, list):
-                    exp = exp[0] if exp else None
-                if exp and hasattr(exp, "strftime"):
-                    delta = exp - datetime.now(timezone.utc)
-                    info["domain_days_left"] = max(0, delta.days)
-        except Exception:
-            pass
-
-        # uapis.cn API 兜底
-        if not merged:
+        # WHOIS 查询 → whois.blid.top（小主人自建API）
+        if self.whois_api_key:
             try:
-                async with aiohttp.ClientSession(timeout=ClientTimeout(total=8)) as sess:
+                async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as sess:
                     async with sess.get(
-                        f"https://uapis.cn/api/v1/network/whois?domain={domain}&format=json"
+                        f"https://whois.blid.top/{domain}",
+                        headers={
+                            "Authorization": f"Bearer {self.whois_api_key}",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        },
                     ) as resp:
                         if resp.status == 200:
-                            api_data = await resp.json()
-                            wd = api_data.get("whois", {})
-                            di = wd.get("domain", {})
-                            ri = wd.get("registrar", {})
-                            api_m = {}
-                            if ri.get("name"):
-                                api_m["registrar"] = ri["name"]
-                            for k, s in [("creation_date","created_date"),("expiration_date","expiration_date"),("updated_date","updated_date")]:
-                                v = di.get(s)
-                                if v:
-                                    api_m[k] = v
-                            if api_m:
-                                info["registrar"] = api_m.get("registrar")
-                                info["creation_date"] = self._format_whois_date(api_m.get("creation_date"))
-                                info["expiration_date"] = self._format_whois_date(api_m.get("expiration_date"))
-                                info["updated_date"] = self._format_whois_date(api_m.get("updated_date"))
-                                exp = api_m.get("expiration_date")
+                            d = await resp.json()
+                            if d.get("isRegistered"):
+                                info["registrar"] = d.get("registrar", {}).get("name")
+                                dates = d.get("dates", {})
+                                for src_key, dst_key in [("created", "creation_date"), ("expires", "expiration_date"), ("updated", "updated_date")]:
+                                    val = dates.get(src_key)
+                                    if val:
+                                        info[dst_key] = str(val)[:10]
+                                exp = dates.get("expires")
                                 if exp:
                                     try:
-                                        ed = datetime.strptime(str(exp)[:10], "%Y-%m-%d")
+                                        ed = datetime.strptime(str(exp)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
                                         info["domain_days_left"] = max(0, (ed - datetime.now(timezone.utc)).days)
                                     except Exception:
                                         pass
-            except Exception:
-                pass
-
-        # whoiscx.com API 兜底
-        if not info.get("registrar") or not info.get("creation_date"):
-            try:
-                async with aiohttp.ClientSession(timeout=ClientTimeout(total=8)) as sess:
-                    async with sess.get(
-                        f"https://api.whoiscx.com/whois/?domain={domain}"
-                    ) as resp:
-                        if resp.status == 200:
-                            cx = await resp.json()
-                            if cx.get("status") == 1:
-                                ci = cx.get("data", {}).get("info", {})
-                                if ci.get("registrar_name"):
-                                    info["registrar"] = ci["registrar_name"]
-                                if ci.get("creation_time"):
-                                    info["creation_date"] = ci["creation_time"][:10]
-                                if ci.get("expiration_time"):
-                                    info["expiration_date"] = ci["expiration_time"][:10]
-                                if ci.get("valid_days") is not None:
-                                    info["domain_days_left"] = ci["valid_days"]
             except Exception:
                 pass
 
@@ -458,62 +396,61 @@ class QQProfilePlugin(Star):
         if ssl_info.get("ssl_days_left") is not None:
             info["ssl_days_left"] = ssl_info["ssl_days_left"]
             info["ssl_expiry"] = ssl_info["ssl_expiry"]
-        if info["ssl_days_left"] is None:
-            from urllib.parse import quote
-            for ssl_api in [
-                f"https://api.shanhe.kim{quote('/API/SSL证书查询.php')}?url=https://{domain}",
-                f"https://cn.apihz.cn/api/wangzhan/sslq.php?id=88888888&key=88888888&url={domain}",
-            ]:
-                try:
-                    async with aiohttp.ClientSession(timeout=ClientTimeout(total=8)) as sess:
-                        async with sess.get(ssl_api) as resp:
-                            if resp.status == 200:
-                                d = await resp.json()
-                                v = d if "days_remaining" in d else d.get("validity", {})
-                                dr = v.get("days_remaining")
-                                if dr is not None:
-                                    info["ssl_days_left"] = int(dr)
-                                    vt = v.get("valid_to", "")[:10]
-                                    if vt:
-                                        info["ssl_expiry"] = vt
-                                    break
-                except Exception:
-                    continue
         return info
 
     async def _fetch_ssl_cert_info(self, domain: str) -> dict:
-        """直接通过 SSL 握手获取证书信息，不依赖 WHOIS"""
-        import ssl
-        import socket
         result = {"ssl_days_left": None, "ssl_expiry": None}
-        try:
-            loop = asyncio.get_event_loop()
-            cert = await asyncio.wait_for(
-                loop.run_in_executor(None, self._get_ssl_cert, domain),
-                timeout=8,
-            )
-            if cert:
-                not_after = cert.get("notAfter")
-                if not_after:
-                    exp = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-                    days = (exp - datetime.now(timezone.utc)).days
-                    result["ssl_days_left"] = max(0, days)
-                    result["ssl_expiry"] = exp.strftime("%Y-%m-%d")
-        except Exception:
-            pass
-        return result
 
-    @staticmethod
-    def _get_ssl_cert(domain: str) -> dict | None:
-        import ssl
-        import socket
-        try:
-            ctx = ssl._create_unverified_context()
-            with socket.create_connection((domain, 443), timeout=8) as sock:
-                with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
-                    return ssock.getpeercert()
-        except Exception:
-            return None
+        if self.ssl_api_key:
+            try:
+                async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as sess:
+                    async with sess.get(
+                        f"https://ssl.blid.top/ssl/{domain}",
+                        headers={
+                            "Authorization": f"Bearer {self.ssl_api_key}",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        },
+                    ) as resp:
+                        if resp.status == 200:
+                            d = await resp.json()
+                            cc = d.get("current_certificate", {})
+                            dr = cc.get("days_remaining")
+                            if dr is not None:
+                                result["ssl_days_left"] = int(dr)
+                                na = cc.get("not_after", "")
+                                if na:
+                                    result["ssl_expiry"] = str(na)[:10]
+                            else:
+                                na = cc.get("not_after", "") or ""
+                                if na:
+                                    try:
+                                        exp = datetime.strptime(str(na)[:19], "%Y-%m-%dT%H:%M:%S")
+                                        result["ssl_days_left"] = max(0, (exp.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days)
+                                        result["ssl_expiry"] = exp.strftime("%Y-%m-%d")
+                                    except Exception:
+                                        pass
+            except Exception:
+                pass
+
+        if result["ssl_days_left"] is None:
+            try:
+                import ssl as _ssl
+                from cryptography import x509
+                from cryptography.hazmat.backends import default_backend
+                loop = asyncio.get_event_loop()
+                cert_pem = await loop.run_in_executor(
+                    None, lambda: _ssl.get_server_certificate((domain, 443))
+                )
+                cert = x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
+                na = cert.not_valid_after
+                if na:
+                    if na.tzinfo is None:
+                        na = na.replace(tzinfo=timezone.utc)
+                    result["ssl_days_left"] = max(0, (na - datetime.now(timezone.utc)).days)
+                    result["ssl_expiry"] = na.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        return result
 
     # 命令：/绑定网站
 
@@ -736,6 +673,62 @@ class QQProfilePlugin(Star):
 
         yield event.plain_result(result)
 
+    @filter.command("查询备案")
+    async def query_icp(self, event: AstrMessageEvent):
+        msg = event.get_message_str()
+        parts = re.split(r"\s+", msg.strip())
+        if len(parts) > 1 and re.match(DOMAIN_REGEX, parts[1]):
+            domain = parts[1]
+        else:
+            sender_id = event.get_sender_id()
+            profile = await self._get_profile(sender_id)
+            if not profile or not profile.get("site"):
+                yield event.plain_result("❌ 您尚未绑定网站，也无法识别域名参数。\n用法：/查询备案 或 /查询备案 域名")
+                return
+            domain = profile["site"]["domain"]
+        if not self.icp_api_key:
+            yield event.plain_result("❌ 未配置 ICP 密钥，请在插件配置中填写 ICP密钥。")
+            return
+        yield event.plain_result(f"🔍 正在查询 {domain} 的 ICP 备案信息，请稍候...")
+        import aiohttp
+        from aiohttp import ClientTimeout
+        try:
+            async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as sess:
+                async with sess.get(
+                    "https://icp.blid.top/query/web",
+                    params={"search": domain},
+                    headers={
+                        "Authorization": f"Bearer {self.icp_api_key}",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        yield event.plain_result(f"❌ ICP 查询失败，HTTP {resp.status}。")
+                        return
+                    raw = await resp.json()
+                    params = raw.get("params", {})
+                    items = params.get("list", [])
+                    total = params.get("total", 0)
+                    if not items:
+                        yield event.plain_result(f"📋 未找到 {domain} 的 ICP 备案信息。")
+                        return
+                    lines = [f"📋 ICP 备案信息 — {domain}"]
+                    for item in items[:5]:
+                        nature = item.get('natureName', '')
+                        unit_label = "备案主体" if nature == "个人" else "主办单位"
+                        lines.append(
+                            f"\n    {item.get('domain', 'N/A')}\n"
+                            f"   {unit_label}: {item.get('unitName', 'N/A')}\n"
+                            f"   备案号: {item.get('serviceLicence', 'N/A')}\n"
+                            f"   备案性质: {nature}\n"
+                            f"   通过时间: {item.get('updateRecordTime', 'N/A')}"
+                        )
+                    if total > 5:
+                        lines.append(f"\n... 共 {total} 条，仅展示前 5 条。")
+                    yield event.plain_result("\n".join(lines))
+        except Exception as e:
+            yield event.plain_result(f"❌ ICP 查询失败: {type(e).__name__}")
+
     # 命令：/删除档案（群主/管理员专用）
 
     @filter.command("删除档案")
@@ -774,6 +767,70 @@ class QQProfilePlugin(Star):
 
         yield event.plain_result(f"✅ 已删除用户 [{username}] 的档案。")
 
+    @staticmethod
+    def _fmt_days(days: int) -> str:
+        if days is None:
+            return "未知"
+        if days >= 365:
+            y = days // 365
+            if y >= 10:
+                return f"{y}年"
+            return f"{y}年"
+        if days >= 30:
+            m = days // 30
+            return f"{m}个月"
+        return f"{days}天"
+
+    async def _get_rankings(self):
+        raw = await self.get_kv_data("_rankings", None)
+        if raw and isinstance(raw, str):
+            import json as _json
+            try:
+                return _json.loads(raw)
+            except Exception:
+                return []
+        if isinstance(raw, list):
+            return raw
+        return []
+
+    async def _save_ranking(self, domain, name, score):
+        import json as _json
+        rankings = await self._get_rankings()
+        now = datetime.now(timezone.utc).isoformat()
+        updated = False
+        for r in rankings:
+            if r["domain"] == domain:
+                r["score"] = score
+                r["time"] = now
+                updated = True
+                break
+        if not updated:
+            rankings.append({"domain": domain, "name": name, "score": score, "time": now})
+        perfect = [r for r in rankings if r["score"] >= 5.0]
+        perfect.sort(key=lambda x: x["time"])
+        others = [r for r in rankings if r["score"] < 5.0]
+        others.sort(key=lambda x: (-x["score"], x["time"]))
+        rankings = perfect[-5:] + others
+        await self.put_kv_data("_rankings", _json.dumps(rankings, ensure_ascii=False))
+
+    @filter.command("排行")
+    async def ranking(self, event: AstrMessageEvent):
+        rankings = await self._get_rankings()
+        if not rankings:
+            yield event.plain_result("📊 暂无排行榜数据，快去用 /评价 打分吧！")
+            return
+        perfect = [r for r in rankings if r["score"] >= 5.0]
+        perfect.sort(key=lambda x: x["time"])
+        others = [r for r in rankings if r["score"] < 5.0]
+        others.sort(key=lambda x: (-x["score"], x["time"]))
+        merged = perfect[-5:] + others
+        lines = ["🏆 网站排行榜 TOP12"]
+        for i, r in enumerate(merged[:12]):
+            medal = ["🥇", "🥈", "🥉"][i] if i < 3 else f"{i+1}."
+            sc = float(r["score"])
+            lines.append(f"{medal} {sc}/5.0  {r['domain']}")
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("评价")
     async def rate_site(self, event: AstrMessageEvent):
         sender_id = event.get_sender_id()
@@ -786,31 +843,35 @@ class QQProfilePlugin(Star):
         domain = site["domain"]
         yield event.plain_result(f"🔍 正在分析 {domain} 的各项数据，请稍候...")
 
-        info = await self._fetch_domain_info(domain)
+        try:
+            info = await self._fetch_domain_info(domain)
+        except Exception:
+            info = {}
         score = 0.0
         details = []
 
         # ① 域名有效期 (0.5分)
         days = info.get("domain_days_left")
         if days is not None:
+            ft = self._fmt_days(days)
             if days >= 365:
                 score += 0.5
-                details.append("✅ 域名有效期充裕(>1年)")
+                details.append(f"✅ 域名有效期充裕({ft})")
             elif days >= 180:
                 score += 0.4
-                details.append("✅ 域名有效期较长(>6个月)")
+                details.append(f"✅ 域名有效期较长({ft})")
             elif days >= 90:
                 score += 0.3
-                details.append("⚪ 域名有效期尚可(>3个月)")
+                details.append(f"⚪ 域名有效期尚可({ft})")
             elif days >= 30:
                 score += 0.1
-                details.append("🔴 域名即将到期(<30天)")
+                details.append(f"🔴 域名即将到期({ft})")
             else:
                 details.append("🔴 域名已到期")
         else:
             details.append("⚪ 暂无数据域名有效期")
 
-        # ② 证书情况 (0.5分) — SSL 直查 → API 兜底
+        # ② 证书情况 (0.5分)
         ssl_days = info.get("ssl_days_left")
         if ssl_days is not None:
             if ssl_days >= 90:
@@ -823,26 +884,7 @@ class QQProfilePlugin(Star):
                 score += 0.1
                 details.append(f"🔴 证书即将过期({ssl_days}天)")
         else:
-            exp_date = info.get("expiration_date")
-            if exp_date and exp_date != "未知":
-                try:
-                    exp = datetime.strptime(exp_date, "%Y-%m-%d")
-                    remain = (exp - datetime.now(timezone.utc)).days
-                    if remain >= 90:
-                        score += 0.5
-                        details.append("✅ 证书有效期充足(>3个月)")
-                    elif remain >= 30:
-                        score += 0.3
-                        details.append("⚪ 证书即将到期(<30天)")
-                    elif remain >= 0:
-                        score += 0.1
-                        details.append("🔴 证书即将过期")
-                    else:
-                        details.append("🔴 证书已过期")
-                except Exception:
-                    details.append("⚪ 暂无数据证书信息")
-            else:
-                details.append("⚪ 暂无数据证书信息")
+            details.append("⚪ 暂无数据证书信息")
 
         # ③ 网站响应速度 (0.5分)
         status = info.get("status")
@@ -916,7 +958,7 @@ class QQProfilePlugin(Star):
                 age_days = (datetime.now(timezone.utc) - created).days
                 if age_days >= 365:
                     score += 0.5
-                    details.append(f"✅ 域名注册已超过1年({age_days//365}年)")
+                    details.append(f"✅ 域名注册已超过({self._fmt_days(age_days)})")
                 elif age_days >= 180:
                     score += 0.3
                     details.append(f"⚪ 域名注册超过6个月")
@@ -991,3 +1033,4 @@ class QQProfilePlugin(Star):
         if ssl_expiry:
             result += f"\n\nSSL证书有效期至 {ssl_expiry}"
         yield event.plain_result(result)
+        await self._save_ranking(domain, site["name"], final_score)
