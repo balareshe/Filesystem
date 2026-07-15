@@ -413,7 +413,7 @@ class QQProfilePlugin(Star):
         return info
 
     async def _fetch_ssl_cert_info(self, domain: str) -> dict:
-        result = {"ssl_days_left": None, "ssl_expiry": None}
+        result = {"ssl_days_left": None, "ssl_expiry": None, "issuer": None, "subject": None, "san": [], "not_before": None}
 
         if self.ssl_api_key:
             try:
@@ -421,7 +421,7 @@ class QQProfilePlugin(Star):
                     async with sess.get(
                         f"https://ssl.blid.top/ssl/{domain}",
                         headers={
-                            "Authorization": f"Bearer {self.ssl_api_key}",
+                            "X-API-Key": self.ssl_api_key,
                             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         },
                     ) as resp:
@@ -431,9 +431,7 @@ class QQProfilePlugin(Star):
                             dr = cc.get("days_remaining")
                             if dr is not None:
                                 result["ssl_days_left"] = int(dr)
-                                na = cc.get("not_after", "")
-                                if na:
-                                    result["ssl_expiry"] = str(na)[:10]
+                                result["ssl_expiry"] = str(cc.get("not_after", ""))[:10]
                             else:
                                 na = cc.get("not_after", "") or ""
                                 if na:
@@ -443,6 +441,13 @@ class QQProfilePlugin(Star):
                                         result["ssl_expiry"] = exp.strftime("%Y-%m-%d")
                                     except Exception:
                                         pass
+                            issuer = cc.get("issuer", {})
+                            result["issuer"] = issuer.get("common_name", "") or issuer.get("organization", "")
+                            result["subject"] = cc.get("subject", {}).get("common_name", "")
+                            result["san"] = cc.get("san", []) or []
+                            nb = cc.get("not_before", "")
+                            if nb:
+                                result["not_before"] = str(nb)[:10]
             except Exception:
                 pass
 
@@ -456,12 +461,24 @@ class QQProfilePlugin(Star):
                     None, lambda: _ssl.get_server_certificate((domain, 443))
                 )
                 cert = x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
+                nb = cert.not_valid_before
+                if nb:
+                    result["not_before"] = nb.strftime("%Y-%m-%d") if nb.tzinfo else nb.replace(tzinfo=timezone.utc).strftime("%Y-%m-%d")
                 na = cert.not_valid_after
                 if na:
                     if na.tzinfo is None:
                         na = na.replace(tzinfo=timezone.utc)
                     result["ssl_days_left"] = max(0, (na - datetime.now(timezone.utc)).days)
                     result["ssl_expiry"] = na.strftime("%Y-%m-%d")
+                try:
+                    result["issuer"] = cert.issuer.rfc4514_string()
+                except Exception:
+                    pass
+                try:
+                    alt = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+                    result["san"] = alt.value.get_values_for_type(x509.DNSName)
+                except Exception:
+                    pass
             except Exception:
                 pass
         return result
@@ -794,47 +811,29 @@ class QQProfilePlugin(Star):
             yield event.plain_result("❌ 未配置 SSL 密钥，请在插件配置中填写 SSL密钥。")
             return
         yield event.plain_result(f"🔍 正在查询 {domain} 的 SSL 证书，请稍候...")
-        import aiohttp
-        from aiohttp import ClientTimeout
         try:
-            async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as sess:
-                async with sess.get(
-                    f"https://ssl.blid.top/ssl/{domain}",
-                    headers={
-                        "Authorization": f"Bearer {self.ssl_api_key}",
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    },
-                ) as resp:
-                    if resp.status != 200:
-                        yield event.plain_result(f"❌ SSL 查询失败，HTTP {resp.status}。")
-                        return
-                    d = await resp.json()
-                    cc = d.get("current_certificate", {})
-                    if not cc:
-                        yield event.plain_result(f"📋 未找到 {domain} 的 SSL 证书信息。")
-                        return
-                    issuer = cc.get("issuer", {})
-                    subject = cc.get("subject", {})
-                    san = cc.get("san", [])
-                    lines = ["📋 SSL 证书信息", ""]
-                    lines.append(f"域名: {cc.get('domain', domain)}")
-                    lines.append(f"主题: {subject.get('common_name', 'N/A')}")
-                    issuer_name = issuer.get('common_name', '') or issuer.get('organization', '') or 'N/A'
-                    lines.append(f"颁发者: {issuer_name}")
-                    lines.append(f"生效时间: {cc.get('not_before', 'N/A')}")
-                    lines.append(f"到期时间: {cc.get('not_after', 'N/A')}")
-                    dr = cc.get('days_remaining')
-                    if dr is not None:
-                        lines.append(f"剩余天数: {dr} 天")
-                    if san:
-                        lines.append(f"覆盖域名: {', '.join(san[:5])}")
-                        if len(san) > 5:
-                            lines.append(f"  ... 共 {len(san)} 个域名")
-                    summary = d.get("summary", {})
-                    warning = summary.get("expiry_warning", "")
-                    if warning and warning != "OK":
-                        lines.append(f"⚠️ 到期预警: {warning}")
-                    yield event.plain_result("\n".join(lines))
+            info = await self._fetch_ssl_cert_info(domain)
+            if info.get("ssl_days_left") is None:
+                yield event.plain_result(f"📋 未能获取 {domain} 的 SSL 证书信息。")
+                return
+            lines = ["📋 SSL 证书信息", ""]
+            lines.append(f"域名: {domain}")
+            if info.get("subject"):
+                lines.append(f"主题: {info['subject']}")
+            if info.get("issuer"):
+                lines.append(f"颁发者: {info['issuer']}")
+            if info.get("not_before"):
+                lines.append(f"生效时间: {info['not_before']}")
+            if info.get("ssl_expiry"):
+                lines.append(f"到期时间: {info['ssl_expiry']}")
+            if info.get("ssl_days_left") is not None:
+                lines.append(f"剩余天数: {info['ssl_days_left']} 天")
+            san = info.get("san", [])
+            if san:
+                lines.append(f"覆盖域名: {', '.join(san[:5])}")
+                if len(san) > 5:
+                    lines.append(f"  ... 共 {len(san)} 个域名")
+            yield event.plain_result("\n".join(lines))
         except Exception as e:
             yield event.plain_result(f"❌ SSL 查询失败: {type(e).__name__}")
 
