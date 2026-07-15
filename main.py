@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 from datetime import datetime, timezone
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -9,7 +10,7 @@ from astrbot.api.message_components import At
 
 SITE_TYPES = {"博客", "企业", "个人", "商城", "论坛", "其他"}
 
-DOMAIN_REGEX = r"^[a-zA-Z0-9][-a-zA-Z0-9]*(\.[a-zA-Z0-9][-a-zA-Z0-9]*)+$"
+DOMAIN_REGEX = r"^[a-zA-Z0-9\u4e00-\u9fff][-a-zA-Z0-9\u4e00-\u9fff]*(\.[a-zA-Z0-9\u4e00-\u9fff][-a-zA-Z0-9\u4e00-\u9fff]*)+$"
 
 
 class QQProfilePlugin(Star):
@@ -72,8 +73,16 @@ class QQProfilePlugin(Star):
         raw = await self.get_kv_data(f"_user_group_{qq}", None)
         return str(raw) if raw else None
 
+    @staticmethod
+    def _normalize_domain(domain: str) -> str:
+        try:
+            return domain.encode("idna").decode("ascii")
+        except Exception:
+            return domain
+
     async def _check_domain_owner(self, domain: str, exclude_qq: str = "") -> dict | None:
-        raw = await self.get_kv_data(f"_domain_{domain}", None)
+        key = self._normalize_domain(domain)
+        raw = await self.get_kv_data(f"_domain_{key}", None)
         if raw is None:
             return None
         qq = str(raw)
@@ -157,6 +166,12 @@ class QQProfilePlugin(Star):
 
     @filter.command("hda")
     async def help_command(self, event: AstrMessageEvent):
+        uid = event.get_sender_id()
+        now = time.time()
+        last = await self.get_kv_data(f"_hda_cd_{uid}", "0")
+        if float(last) + 10 > now:
+            return
+        await self.put_kv_data(f"_hda_cd_{uid}", str(now))
         yield event.plain_result(
             "📋 用户档案系统 - 命令列表\n\n"
             "/绑定账号   绑定账号创建档案\n"
@@ -164,14 +179,13 @@ class QQProfilePlugin(Star):
             "/绑定网站   绑定网站信息\n"
             "/更新网站   更新网站信息\n"
             "/解绑网站   解绑网站信息\n"
-            "/查询域名   查询域名实时信息\n"
-            "/查询备案   查询域名ICP备案信息\n"
-            "/查询证书   查询域名SSL证书信息\n"
+            "/查询域名   查询域名信息\n"
+            "/查询备案   查询域名ICP备案\n"
+            "/查询证书   查询域名SSL证书\n"
             "/删除档案   删除用户档案(管理)\n"
             "/评价       对网站进行综合评价\n"
             "/排行       查看评价排行榜TOP12\n\n"
-            "💡 /绑定网站 支持智能识别\n"
-            "发送 /绑定网站 域名 即可自动获取网站名称"
+            "/绑定网站 <域名> 自动获取信息"
         )
 
     # 命令：/查询档案
@@ -302,6 +316,7 @@ class QQProfilePlugin(Star):
         return None
 
     async def _fetch_domain_info(self, domain: str) -> dict:
+        domain = self._normalize_domain(domain)
         import aiohttp
         import socket
         from aiohttp import ClientTimeout
@@ -413,6 +428,7 @@ class QQProfilePlugin(Star):
         return info
 
     async def _fetch_ssl_cert_info(self, domain: str) -> dict:
+        domain = self._normalize_domain(domain)
         result = {"ssl_days_left": None, "ssl_expiry": None, "issuer": None, "subject": None, "san": [], "not_before": None}
 
         if self.ssl_api_key:
@@ -457,8 +473,11 @@ class QQProfilePlugin(Star):
                 from cryptography import x509
                 from cryptography.hazmat.backends import default_backend
                 loop = asyncio.get_event_loop()
-                cert_pem = await loop.run_in_executor(
-                    None, lambda: _ssl.get_server_certificate((domain, 443))
+                cert_pem = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, lambda: _ssl.get_server_certificate((domain, 443))
+                    ),
+                    timeout=10,
                 )
                 cert = x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
                 nb = cert.not_valid_before
@@ -568,7 +587,7 @@ class QQProfilePlugin(Star):
             profile["groupId"] = event.get_group_id()
 
         await self._save_profile(sender_id, profile)
-        await self.put_kv_data(f"_domain_{domain}", sender_id)
+        await self.put_kv_data(f"_domain_{self._normalize_domain(domain)}", sender_id)
         await self._record_last_group(sender_id, group_id)
 
         result = "✅ 站点绑定成功，域名已锁定！\n\n"
@@ -630,9 +649,9 @@ class QQProfilePlugin(Star):
         profile["updatedAt"] = self._now_utc()
         await self._save_profile(sender_id, profile)
         await self._record_last_group(sender_id, group_id)
-        await self.put_kv_data(f"_domain_{domain}", sender_id)
+        await self.put_kv_data(f"_domain_{self._normalize_domain(domain)}", sender_id)
         if old_domain and old_domain != domain:
-            await self.delete_kv_data(f"_domain_{old_domain}")
+            await self.delete_kv_data(f"_domain_{self._normalize_domain(old_domain)}")
 
         yield event.plain_result("✅ 站点信息已更新！")
 
@@ -662,7 +681,7 @@ class QQProfilePlugin(Star):
         profile["updatedAt"] = self._now_utc()
         await self._save_profile(sender_id, profile)
         if old_domain:
-            await self.delete_kv_data(f"_domain_{old_domain}")
+            await self.delete_kv_data(f"_domain_{self._normalize_domain(old_domain)}")
         await self._record_last_group(sender_id, group_id)
 
         yield event.plain_result("✅ 已解绑网站，基础档案仍保留。")
@@ -675,7 +694,7 @@ class QQProfilePlugin(Star):
         parts = re.split(r"\s+", msg.strip())
         direct = False
         if len(parts) > 1 and re.match(DOMAIN_REGEX, parts[1]):
-            domain = parts[1]
+            domain = self._normalize_domain(parts[1])
             direct = True
         else:
             sender_id = event.get_sender_id()
@@ -737,7 +756,7 @@ class QQProfilePlugin(Star):
         parts = re.split(r"\s+", msg.strip())
         is_bound = False
         if len(parts) > 1 and re.match(DOMAIN_REGEX, parts[1]):
-            domain = parts[1]
+            domain = self._normalize_domain(parts[1])
         else:
             sender_id = event.get_sender_id()
             profile = await self._get_profile(sender_id)
@@ -799,7 +818,7 @@ class QQProfilePlugin(Star):
         msg = event.get_message_str()
         parts = re.split(r"\s+", msg.strip())
         if len(parts) > 1 and re.match(DOMAIN_REGEX, parts[1]):
-            domain = parts[1]
+            domain = self._normalize_domain(parts[1])
         else:
             sender_id = event.get_sender_id()
             profile = await self._get_profile(sender_id)

@@ -2,7 +2,7 @@ name: astrbot_plugin_qq_profile
 display_name: 用户档案系统
 desc: 在QQ群内管理用户的档案信息。支持 /绑定账号、/查询档案、/绑定网站、/更新网站、/解绑网站、/删除档案、/查询备案、/查询证书 等命令。
 short_desc: 用户档案管理 — 绑定账号 / 查询档案 / 绑定网站
-version: v1.4.3
+version: v1.4.9
 author: 摆烂人生
 repo: https://github.com/balareshe/Filesystem
 logo: logo.png
