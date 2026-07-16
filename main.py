@@ -998,20 +998,20 @@ class QQProfilePlugin(Star):
         else:
             details.append("⚪ 暂无数据域名有效期")
 
-        # ② 证书情况 (0.5分)
+        # ② SSL证书 (0.5分)
         ssl_days = info.get("ssl_days_left")
         if ssl_days is not None:
-            if ssl_days >= 90:
+            if ssl_days >= 30:
                 score += 0.5
-                details.append(f"✅ 证书有效期充足({ssl_days}天)")
-            elif ssl_days >= 30:
+                details.append(f"✅ SSL证书正常({ssl_days}天)")
+            elif ssl_days >= 10:
                 score += 0.3
-                details.append(f"⚪ 证书即将到期({ssl_days}天)")
+                details.append(f"⚪ 建议续期SSL证书({ssl_days}天)")
             else:
                 score += 0.1
-                details.append(f"🔴 证书即将过期({ssl_days}天)")
+                details.append(f"🔴 证书即将到期({ssl_days}天)")
         else:
-            details.append("⚪ 暂无数据证书信息")
+            details.append("⚪ 暂无数据SSL证书")
 
         # ③ 网站响应速度 (0.5分)
         status = info.get("status")
@@ -1101,18 +1101,7 @@ class QQProfilePlugin(Star):
         else:
             details.append("⚪ 暂无数据域名注册时间")
 
-        # ⑨ SSL证书有效性 (0.5分)
-        ssl_d = info.get("ssl_days_left")
-        if ssl_d is not None:
-            if ssl_d > 20:
-                score += 0.5
-                details.append(f"✅ SSL证书有效({ssl_d}天)")
-            else:
-                details.append(f"🔴 SSL证书即将过期({ssl_d}天)")
-        else:
-            details.append("⚪ 暂无数据SSL证书")
-
-        # ⑩ HTTPS与响应状态 (0.5分)
+        # ⑨ HTTPS与响应状态 (0.5分)
         if status == 200:
             score += 0.5
             details.append("✅ 支持HTTPS且正常响应")
@@ -1123,7 +1112,7 @@ class QQProfilePlugin(Star):
             details.append("🔴 网站无法访问")
 
         # 去掉真正拿不到数据的项（不影响评分）
-        valid_count = 10
+        valid_count = 9
 
         if valid_count > 0:
             max_possible = valid_count * 0.5
@@ -1155,7 +1144,7 @@ class QQProfilePlugin(Star):
 
         result = (
             f"📋 网站评价 - {site['name']}\n"
-            f"{stars} {final_score}/5.0  ({summary} 基于{valid_count}/10项数据)\n\n"
+            f"{stars} {final_score}/5.0  ({summary} 基于{valid_count}/9项数据)\n\n"
             f"{comment}\n\n"
             f"详细评分：\n"
         )
