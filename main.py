@@ -9,7 +9,7 @@
     _next_profile_id      自增编号
     _rankings             JSON 数组，评价榜单
 
-v1.6.2 主要变更（相对 v1.4.1）：
+v1.6.3 主要变更（相对 v1.4.1）：
     * 域名归一化（小写、去 www、拒绝 IP 字面量与内网域名），修复独占锁可被绕过
     * 评价体系重做：6 个维度加权 + 动态分母 + 覆盖率收敛，解决"人人 4.8 分"
     * 评价 v1.6.0：维度重构为 6 项可测信号（新增内容与工程），冷启动 3 次采样取中位，
@@ -944,6 +944,7 @@ class QQProfilePlugin(Star):
         ssl_days = ssl_info.get("days_left")
         ssl_state = ssl_info.get("state", "error")
         if ssl_days is not None:
+            # 判定口径：剩余 ≥ 30 天（一个月）即算「合格」，不再视为短板
             if ssl_days >= 365:
                 ratio = 1.0
             elif ssl_days >= 180:
@@ -951,11 +952,11 @@ class QQProfilePlugin(Star):
             elif ssl_days >= 90:
                 ratio = 0.85
             elif ssl_days >= 30:
-                ratio = 0.6
+                ratio = 0.8
             elif ssl_days >= 7:
-                ratio = 0.3
+                ratio = 0.4
             elif ssl_days > 0:
-                ratio = 0.1
+                ratio = 0.15
             else:
                 ratio = 0.0
 
@@ -1000,7 +1001,7 @@ class QQProfilePlugin(Star):
             suffix = f"（冷启动 {len(samples)} 次中位）" if len(samples) > 1 else ""
             rows.append(("latency", "响应速度", 10, ratio, f"{latency}ms{suffix}"))
 
-        # 6. 域名年龄（权重降到 5：新域名不该一棍子打死）
+        # 6. 域名年龄（权重 5）：注册满一年即算「合格」
         age_days = info.get("domain_age_days")
         if age_days is None:
             rows.append(("domain_age", "域名年龄", 5, None, "未获取注册时间"))
@@ -1008,15 +1009,15 @@ class QQProfilePlugin(Star):
             if age_days >= 1825:
                 ratio = 1.0
             elif age_days >= 1095:
-                ratio = 0.85
+                ratio = 0.9
             elif age_days >= 365:
-                ratio = 0.7
+                ratio = 0.8
             elif age_days >= 180:
-                ratio = 0.5
+                ratio = 0.55
             elif age_days >= 30:
-                ratio = 0.25
+                ratio = 0.3
             else:
-                ratio = 0.1
+                ratio = 0.15
             rows.append(
                 ("domain_age", "域名年龄", 5, ratio, f"已注册 {format_days(age_days)}")
             )
@@ -1061,7 +1062,7 @@ class QQProfilePlugin(Star):
 
         ssl_info = info.get("ssl") or {}
         ssl_days = ssl_info.get("days_left")
-        if ssl_days is not None and ssl_days <= 30:
+        if ssl_days is not None and ssl_days < 30:
             tips.append(f"证书 {ssl_days} 天后到期，尽快续签")
         elif info.get("reachable") and not info.get("https_ok"):
             tips.append("未启用 HTTPS，会被降权")
@@ -1811,7 +1812,7 @@ class QQProfilePlugin(Star):
                 lines.append(f"  ... 共 {len(san)} 个域名")
         if info.get("source"):
             lines.append(f"数据来源: {info['source']}")
-        if info.get("days_left") is not None and info["days_left"] <= 30:
+        if info.get("days_left") is not None and info["days_left"] < 30:
             lines.append("⚠️ 证书即将到期，请及时续签")
 
         yield event.plain_result("\n".join(lines))
