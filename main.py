@@ -9,9 +9,11 @@
     _next_profile_id      自增编号
     _rankings             JSON 数组，评价榜单
 
-v1.5.1 主要变更（相对 v1.4.1）：
+v1.6.0 主要变更（相对 v1.4.1）：
     * 域名归一化（小写、去 www、拒绝 IP 字面量与内网域名），修复独占锁可被绕过
     * 评价体系重做：6 个维度加权 + 动态分母 + 覆盖率收敛，解决"人人 4.8 分"
+    * 评价 v1.6.0：维度重构为 6 项可测信号（新增内容与工程），冷启动 3 次采样取中位，
+      证书校验 SAN 覆盖，识别 200 伪装的错误页，并记录历史做趋势对比
     * 域名/证书/HTTP 并发探测 + 结果缓存，避免串行 40 秒和第三方限流
     * 免密钥 SSL 直连兜底、SSRF 防护、异常进日志、文案与实现对齐
 """
@@ -54,17 +56,38 @@ UA = (
 
 CACHE_TTL = 600          # 域名探测结果缓存秒数
 CACHE_MAX = 256          # 缓存条目上限
+HTTP_SAMPLES = 3         # 响应速度采样次数（取中位数，单次测量抖动太大）
 
 # 评价维度：(内部键, 展示名, 权重)。权重合计 100。
+# 域名年龄只占 5 分：新域名不该被一棍子打死，它也不是"网站质量"的主要因素。
 DIMENSIONS = (
-    ("availability", "可用性", 30),
-    ("domain_expiry", "域名有效期", 20),
+    ("availability", "可用性", 25),
+    ("content_engineering", "内容与工程", 25),
     ("ssl", "SSL 证书", 20),
+    ("domain_expiry", "域名有效期", 15),
     ("latency", "响应速度", 10),
-    ("domain_age", "域名年龄", 10),
-    ("content", "内容质量", 10),
+    ("domain_age", "域名年龄", 5),
 )
 TOTAL_WEIGHT = sum(w for _, _, w in DIMENSIONS)
+
+# 这些响应头是「工程是否讲究」的可测证据，命中越多越像正经站点
+SECURITY_HEADERS = (
+    "Strict-Transport-Security",
+    "X-Content-Type-Options",
+    "X-Frame-Options",
+    "Content-Security-Policy",
+)
+
+# 疑似错误页 / 维护页 / 停放页的特征词（只在标题或极小的页面里匹配，避免误伤正文）
+ERROR_PAGE_HINTS = (
+    "网站建设中", "站点建设中", "域名未绑定", "未绑定域名", "站点未绑定",
+    "域名已过期", "站点已暂停", "该站点不存在", "页面不存在", "正在维护",
+    "404 not found", "403 forbidden", "502 bad gateway", "503 service unavailable",
+    "domain not found", "site not found", "under construction", "coming soon",
+)
+
+RE_META_DESC = re.compile(r'<meta[^>]+name\s*=\s*["\']description["\']', re.IGNORECASE)
+RE_META_VIEWPORT = re.compile(r'<meta[^>]+name\s*=\s*["\']viewport["\']', re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,6 +116,31 @@ def normalize_domain(raw: str) -> str | None:
     if any(domain.endswith(suffix) for suffix in BLOCKED_SUFFIXES):
         return None
     return domain
+
+
+def looks_like_error_page(
+    status: int | None, title: str | None, html: str
+) -> tuple[bool, str | None]:
+    """判断页面是不是「伪装成 200 的错误页/维护页/停放页」。
+
+    只在两个地方匹配，避免误伤正常正文：
+        * 标题里出现特征词
+        * 页面本身很小（< 3KB）且正文里出现特征词
+    """
+    if status is not None and status >= 400:
+        return True, f"HTTP {status}"
+
+    title_text = (title or "").lower()
+    for hint in ERROR_PAGE_HINTS:
+        if hint.lower() in title_text:
+            return True, hint
+
+    if len(html) < 3000:
+        head = html[:3000].lower()
+        for hint in ERROR_PAGE_HINTS:
+            if hint.lower() in head:
+                return True, hint
+    return False, None
 
 
 def format_days(days: int | None) -> str:
@@ -390,38 +438,85 @@ class QQProfilePlugin(Star):
         return public[0] if public else None
 
     async def _probe_http(self, domain: str) -> dict:
-        """抓 HTTP 状态、延迟、Server 头、页面标题，并判定 HTTPS 是否可用。"""
+        """抓 HTTP 状态、延迟中位数、Server 头、页面特征与安全响应头。
+
+        除状态码外还采集这些「真实」信号，用于后续打分：
+            * 响应速度：取样 HTTP_SAMPLES 次取中位数（单次测量受抖动影响太大）
+            * 传输压缩：Content-Encoding 里是否有 gzip/br/zstd
+            * 移动适配：<meta name="viewport">
+            * 搜索摘要：<meta name="description">
+            * 工程规范：HSTS / nosniff / X-Frame-Options / CSP 命中数
+            * 错误页伪装：返回 200 但内容像"建设中/未绑定/404"
+        """
         result = {
-            "status": None, "latency_ms": None, "server": "",
-            "title": None, "https_ok": False, "scheme": None, "reachable": False,
+            "status": None, "latency_ms": None, "ttfb_ms": None, "samples": [],
+            "server": "", "title": None, "https_ok": False, "scheme": None,
+            "reachable": False, "content_encoding": "", "html_bytes": 0,
+            "has_meta_description": False, "has_viewport": False,
+            "security_headers": 0, "looks_like_error_page": False, "error_hint": None,
         }
-        timeout = ClientTimeout(total=10)
-        async with aiohttp.ClientSession(
-            timeout=timeout, headers={"User-Agent": UA}
-        ) as session:
-            for scheme in ("https", "http"):
-                if result["reachable"]:
-                    break
+        headers = {"User-Agent": UA, "Accept-Encoding": "gzip, deflate, br, zstd"}
+
+        for scheme in ("https", "http"):
+            if result["reachable"]:
+                break
+            url = f"{scheme}://{domain}"
+            samples: list[int] = []
+            for index in range(HTTP_SAMPLES):
                 try:
-                    started = time.perf_counter()
-                    async with session.get(
-                        f"{scheme}://{domain}", allow_redirects=True
-                    ) as resp:
-                        raw = await resp.content.read(200_000)
-                        elapsed = int((time.perf_counter() - started) * 1000)
-                        body = raw.decode("utf-8", "ignore")
-                        result.update(
-                            status=resp.status,
-                            latency_ms=elapsed,
-                            server=resp.headers.get("Server", "") or "",
-                            title=extract_title(body),
-                            scheme=scheme,
-                            reachable=True,
-                        )
-                        if scheme == "https" and 200 <= resp.status < 400:
-                            result["https_ok"] = True
+                    # 每次采样都新建 session：复用连接测出来的是 50ms 级的热连接耗时，
+                    # 取中位会把真实首访体验（含 DNS + TLS 握手）掩盖掉。
+                    async with aiohttp.ClientSession(
+                        timeout=ClientTimeout(total=15), headers=headers
+                    ) as session:
+                        started = time.perf_counter()
+                        async with session.get(url, allow_redirects=True) as resp:
+                            if index == 0:
+                                ttfb = int((time.perf_counter() - started) * 1000)
+                                raw = await resp.content.read(300_000)
+                                elapsed = int((time.perf_counter() - started) * 1000)
+                                html = raw.decode("utf-8", "ignore")
+                                title = extract_title(html)
+                                error_page, hint = looks_like_error_page(
+                                    resp.status, title, html
+                                )
+                                result.update(
+                                    status=resp.status,
+                                    ttfb_ms=ttfb,
+                                    server=resp.headers.get("Server", "") or "",
+                                    title=title,
+                                    scheme=scheme,
+                                    reachable=True,
+                                    content_encoding=(
+                                        resp.headers.get("Content-Encoding") or ""
+                                    ).lower(),
+                                    html_bytes=len(raw),
+                                    has_meta_description=bool(RE_META_DESC.search(html)),
+                                    has_viewport=bool(RE_META_VIEWPORT.search(html)),
+                                    security_headers=sum(
+                                        1 for name in SECURITY_HEADERS
+                                        if resp.headers.get(name)
+                                    ),
+                                    looks_like_error_page=error_page,
+                                    error_hint=hint,
+                                )
+                                if scheme == "https" and 200 <= resp.status < 400:
+                                    result["https_ok"] = True
+                                samples.append(elapsed)
+                            else:
+                                await resp.content.read(4096)
+                                samples.append(
+                                    int((time.perf_counter() - started) * 1000)
+                                )
                 except Exception as exc:
-                    logger.debug(f"[qq_profile] {scheme}://{domain} 探测失败: {exc!r}")
+                    logger.debug(
+                        f"[qq_profile] {scheme}://{domain} 第 {index + 1} 次采样失败: {exc!r}"
+                    )
+                    break
+            if samples:
+                ordered = sorted(samples)
+                result["samples"] = samples
+                result["latency_ms"] = ordered[len(ordered) // 2]
         return result
 
     async def _fetch_geo(self, ip: str) -> str | None:
@@ -626,10 +721,19 @@ class QQProfilePlugin(Star):
             "location": None,
             "status": None,
             "latency_ms": None,
+            "ttfb_ms": None,
+            "samples": [],
             "server": "",
             "title": None,
             "reachable": False,
             "https_ok": False,
+            "content_encoding": "",
+            "html_bytes": 0,
+            "has_meta_description": False,
+            "has_viewport": False,
+            "security_headers": 0,
+            "looks_like_error_page": False,
+            "error_hint": None,
             "registrar": None,
             "creation_date": None,
             "expiration_date": None,
@@ -672,10 +776,20 @@ class QQProfilePlugin(Star):
             {
                 "status": http_result.get("status"),
                 "latency_ms": http_result.get("latency_ms"),
+                "ttfb_ms": http_result.get("ttfb_ms"),
+                "samples": http_result.get("samples") or [],
                 "server": http_result.get("server", ""),
                 "title": http_result.get("title"),
                 "reachable": http_result.get("reachable", False),
                 "https_ok": http_result.get("https_ok", False),
+                # 下面这些是 v1.6.0 新增的「真实信号」，评价要用
+                "content_encoding": http_result.get("content_encoding", ""),
+                "html_bytes": http_result.get("html_bytes", 0),
+                "has_meta_description": http_result.get("has_meta_description", False),
+                "has_viewport": http_result.get("has_viewport", False),
+                "security_headers": http_result.get("security_headers", 0),
+                "looks_like_error_page": http_result.get("looks_like_error_page", False),
+                "error_hint": http_result.get("error_hint"),
             }
         )
         info["ssl"] = ssl_result or {"days_left": None, "state": "error", "source": None}
@@ -695,11 +809,12 @@ class QQProfilePlugin(Star):
         比例为 None 表示"这批数据没拿到"，不参与分母，也不扣分。
         """
         rows: list[tuple[str, str, int, float | None, str]] = []
+        domain = (info.get("domain") or "").lower()
         status = info.get("status")
         latency = info.get("latency_ms")
         https_ok = bool(info.get("https_ok"))
 
-        # 1. 可用性：响应状态 80% + HTTPS 可用 20%
+        # 1. 可用性：状态码 75% + HTTPS 25%；「200 但内容是错误页」再打 4 折
         if not info.get("reachable") or status is None:
             availability = 0.0
             note = "站点无法访问"
@@ -707,19 +822,90 @@ class QQProfilePlugin(Star):
             if 200 <= status < 300:
                 base = 1.0
             elif 300 <= status < 400:
-                base = 0.85
+                base = 0.9
             elif 400 <= status < 500:
                 base = 0.35
             else:
-                base = 0.2
-            availability = base * 0.8 + (0.2 if https_ok else 0.0)
-            note = f"HTTP {status} · {latency}ms · {'HTTPS 正常' if https_ok else '仅 HTTP 可用'}"
-        rows.append(("availability", "可用性", 30, availability, note))
+                base = 0.15
+            availability = base * 0.75 + (0.25 if https_ok else 0.0)
+            if info.get("looks_like_error_page"):
+                # 返回 200 但没有真实内容，实质上和打不开差不多
+                availability *= 0.25
+                note = (
+                    f"HTTP {status} · 疑似错误页"
+                    f"（{info.get('error_hint') or '内容异常'}）"
+                )
+            else:
+                note = (
+                    f"HTTP {status} · {latency}ms · "
+                    f"{'HTTPS 正常' if https_ok else '仅 HTTP 可用'}"
+                )
+        rows.append(("availability", "可用性", 25, availability, note))
 
-        # 2. 域名有效期
+        # 2. 内容与工程：6 个可测子项，拿不到的子项不进分母
+        if not info.get("reachable"):
+            rows.append(("content_engineering", "内容与工程", 25, None, "站点无响应"))
+        elif info.get("looks_like_error_page"):
+            rows.append((
+                "content_engineering", "内容与工程", 25, 0.0,
+                "疑似错误页，无实际内容",
+            ))
+        else:
+            subs: list[tuple[int, float | None, str]] = []
+
+            title = info.get("title") or ""
+            if title and 2 <= len(title) <= 60 and not info.get("looks_like_error_page"):
+                subs.append((6, 1.0, "标题"))
+            elif title:
+                subs.append((6, 0.6, "标题欠佳"))
+            else:
+                subs.append((6, 0.0, "无标题"))
+
+            subs.append((5, 1.0 if info.get("has_meta_description") else 0.0,
+                         "描述" if info.get("has_meta_description") else "无描述"))
+            subs.append((4, 1.0 if info.get("has_viewport") else 0.0,
+                         "移动适配" if info.get("has_viewport") else "无 viewport"))
+
+            encoding = (info.get("content_encoding") or "").lower()
+            if any(x in encoding for x in ("gzip", "br", "zstd", "deflate")):
+                subs.append((4, 1.0, "压缩"))
+            elif encoding:
+                subs.append((4, 0.3, f"压缩:{encoding}"))
+            else:
+                # 反向代理可能吃掉这个头，当作无数据，不误判"未压缩"
+                subs.append((4, None, "压缩未知"))
+
+            security = info.get("security_headers")
+            if security is None:
+                subs.append((3, None, "安全头未知"))
+            else:
+                subs.append((3, min(1.0, security / 3.0), f"安全头{security}/4"))
+
+            size = info.get("html_bytes") or 0
+            if size >= 2000:
+                subs.append((3, 1.0, "体积正常"))
+            elif size >= 1000:
+                subs.append((3, 0.6, "体积偏小"))
+            elif size > 0:
+                subs.append((3, 0.3, "体积过小"))
+            else:
+                subs.append((3, None, "体积未知"))
+
+            usable = [(w, r) for w, r, _ in subs if r is not None]
+            content_ratio = (
+                sum(w * r for w, r in usable) / sum(w for w, _ in usable)
+                if usable else None
+            )
+            detail = " · ".join(label for _, r, label in subs if r)
+            rows.append((
+                "content_engineering", "内容与工程", 25, content_ratio,
+                detail or "无可测信号",
+            ))
+
+        # 3. 域名有效期
         days_left = info.get("domain_days_left")
         if days_left is None:
-            rows.append(("domain_expiry", "域名有效期", 20, None, "未获取到期时间"))
+            rows.append(("domain_expiry", "域名有效期", 15, None, "未获取到期时间"))
         else:
             if days_left >= 730:
                 ratio = 1.0
@@ -737,11 +923,11 @@ class QQProfilePlugin(Star):
                 ratio = 0.0
             expiry = info.get("expiration_date") or ""
             rows.append(
-                ("domain_expiry", "域名有效期", 20, ratio,
+                ("domain_expiry", "域名有效期", 15, ratio,
                  f"剩余 {format_days(days_left)}" + (f"（{expiry} 到期）" if expiry else ""))
             )
 
-        # 3. SSL 证书
+        # 4. SSL 证书：剩余天数 + 证书是否真的覆盖这个域名
         ssl_info = info.get("ssl") or {}
         ssl_days = ssl_info.get("days_left")
         ssl_state = ssl_info.get("state", "error")
@@ -760,39 +946,52 @@ class QQProfilePlugin(Star):
                 ratio = 0.1
             else:
                 ratio = 0.0
-            source = ssl_info.get("source") or "直连"
-            rows.append(
-                ("ssl", "SSL 证书", 20, ratio,
-                 f"剩余 {format_days(ssl_days)}（{source}）")
+
+            san = [str(x).lower().lstrip("*.") for x in (ssl_info.get("san") or [])]
+            covered = (
+                not domain
+                or not san
+                or any(san_name == domain or domain.endswith("." + san_name)
+                       for san_name in san)
             )
+            if not covered:
+                ratio *= 0.6  # 证书存在但不覆盖当前域名，说明配错了
+
+            source = ssl_info.get("source") or "直连"
+            note = f"剩余 {format_days(ssl_days)}（{source}）"
+            if not covered:
+                note += " · 证书未覆盖本域名"
+            rows.append(("ssl", "SSL 证书", 20, ratio, note))
         elif ssl_state in ("timeout", "error"):
             # 网络原因导致没测到，不给 0 分，直接不计入分母
             rows.append(("ssl", "SSL 证书", 20, None, "证书检测未完成"))
         else:
             rows.append(("ssl", "SSL 证书", 20, 0.0, "443 端口无可用证书"))
 
-        # 4. 响应速度
+        # 5. 响应速度：冷启动（含 DNS + TLS）多次采样取中位
         if latency is None:
             rows.append(("latency", "响应速度", 10, None, "未获取响应时间"))
         else:
-            if latency <= 300:
+            if latency <= 400:
                 ratio = 1.0
-            elif latency <= 600:
+            elif latency <= 800:
                 ratio = 0.9
-            elif latency <= 1000:
+            elif latency <= 1200:
                 ratio = 0.75
-            elif latency <= 2000:
+            elif latency <= 2500:
                 ratio = 0.5
-            elif latency <= 4000:
+            elif latency <= 5000:
                 ratio = 0.25
             else:
                 ratio = 0.1
-            rows.append(("latency", "响应速度", 10, ratio, f"{latency}ms"))
+            samples = info.get("samples") or []
+            suffix = f"（冷启动 {len(samples)} 次中位）" if len(samples) > 1 else ""
+            rows.append(("latency", "响应速度", 10, ratio, f"{latency}ms{suffix}"))
 
-        # 5. 域名年龄
+        # 6. 域名年龄（权重降到 5：新域名不该一棍子打死）
         age_days = info.get("domain_age_days")
         if age_days is None:
-            rows.append(("domain_age", "域名年龄", 10, None, "未获取注册时间"))
+            rows.append(("domain_age", "域名年龄", 5, None, "未获取注册时间"))
         else:
             if age_days >= 1825:
                 ratio = 1.0
@@ -807,30 +1006,7 @@ class QQProfilePlugin(Star):
             else:
                 ratio = 0.1
             rows.append(
-                ("domain_age", "域名年龄", 10, ratio, f"已注册 {format_days(age_days)}")
-            )
-
-        # 6. 内容质量：标题
-        title = info.get("title")
-        if not title:
-            # 站点根本没响应时谈不上"标题质量差"，按无数据处理
-            rows.append((
-                "content", "内容质量", 10,
-                None if not info.get("reachable") else 0.0,
-                "未取到页面标题",
-            ))
-        else:
-            length = len(title)
-            if length >= 10:
-                ratio = 1.0
-            elif length >= 6:
-                ratio = 0.85
-            elif length >= 4:
-                ratio = 0.65
-            else:
-                ratio = 0.4
-            rows.append(
-                ("content", "内容质量", 10, ratio, f"标题「{title[:24]}」")
+                ("domain_age", "域名年龄", 5, ratio, f"已注册 {format_days(age_days)}")
             )
 
         return rows
@@ -861,6 +1037,41 @@ class QQProfilePlugin(Star):
         if score >= 2.0:
             return "存在明显短板，建议检查域名与证书状态。"
         return "网站状态较差，多项指标异常，需要排查。"
+
+    @staticmethod
+    def _suggestions(rows, info: dict) -> list[str]:
+        """把失分项翻译成「具体能做什么」，最多给 3 条，避免刷屏。"""
+        tips: list[str] = []
+
+        if info.get("looks_like_error_page"):
+            tips.append(
+                f"站点返回 200 但内容像错误页（{info.get('error_hint') or '内容异常'}），"
+                "检查是否未绑定域名或处于维护状态"
+            )
+
+        ssl_info = info.get("ssl") or {}
+        ssl_days = ssl_info.get("days_left")
+        if ssl_days is not None and ssl_days <= 30:
+            tips.append(f"SSL 证书仅剩 {ssl_days} 天，尽快续签，否则到期后站点会报不安全")
+        elif info.get("reachable") and not info.get("https_ok"):
+            tips.append("站点未启用 HTTPS 或证书无效，搜索引擎会降权")
+
+        expiry = info.get("domain_days_left")
+        if expiry is not None and expiry <= 90:
+            tips.append(f"域名 {expiry} 天后到期，记得续费，避免过期后被人抢注")
+
+        if info.get("reachable"):
+            if not info.get("has_meta_description"):
+                tips.append("缺少 meta description，搜索结果摘要只能由引擎自行截取")
+            if not info.get("has_viewport"):
+                tips.append("缺少 viewport 声明，手机上会按桌面宽度整体缩放")
+            encoding = (info.get("content_encoding") or "").lower()
+            if not any(x in encoding for x in ("gzip", "br", "zstd", "deflate")):
+                tips.append("未开启 gzip/brotli 压缩，开启后传输体积通常能减半")
+            if (info.get("security_headers") or 0) < 2:
+                tips.append("响应头缺少 HSTS / nosniff 等安全头，建议补齐")
+
+        return tips[:3]
 
     # ------------------------------------------------------------------ #
     # 榜单
@@ -898,6 +1109,61 @@ class QQProfilePlugin(Star):
         await self.put_kv_data(
             "_rankings", json.dumps(perfect[-5:] + others, ensure_ascii=False)
         )
+
+    # ------------------------------------------------------------------ #
+    # 评价历史（用于看趋势）
+    # ------------------------------------------------------------------ #
+
+    HISTORY_KEEP = 10
+
+    async def _load_history(self, domain: str) -> list[dict]:
+        raw = await self.get_kv_data(f"_history_{domain}", None)
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                logger.warning(f"[qq_profile] {domain} 的评价历史损坏，已重置")
+                return []
+            return data if isinstance(data, list) else []
+        return raw if isinstance(raw, list) else []
+
+    async def _push_history(
+        self, domain: str, score: float, coverage: float, rows
+    ) -> None:
+        history = await self._load_history(domain)
+        dims = {
+            key: round(ratio, 2)
+            for key, _label, _w, ratio, _note in rows
+            if ratio is not None
+        }
+        history.append({
+            "t": datetime.now(timezone.utc).isoformat(),
+            "score": score,
+            "coverage": coverage,
+            "dims": dims,
+        })
+        await self.put_kv_data(
+            f"_history_{domain}",
+            json.dumps(history[-self.HISTORY_KEEP:], ensure_ascii=False),
+        )
+
+    @staticmethod
+    def _describe_delta(previous: dict, score: float) -> str | None:
+        """把「和上次比」翻译成人话。"""
+        old = float(previous.get("score", 0))
+        change = round(score - old, 1)
+        if abs(change) < 0.05:
+            head = f"与上次持平（{old}/5.0）"
+        elif change > 0:
+            head = f"较上次 ↑{change}（{old} → {score}）"
+        else:
+            head = f"较上次 ↓{abs(change)}（{old} → {score}）"
+
+        stamp = parse_iso_date(previous.get("t", ""))
+        if stamp:
+            days = (datetime.now(timezone.utc) - stamp).days
+            head += " · " + ("刚刚" if days <= 0 else f"{days} 天前")
+        return head
 
     # ------------------------------------------------------------------ #
     # 命令：帮助
@@ -1301,6 +1567,16 @@ class QQProfilePlugin(Star):
         if ssl_info.get("days_left") is not None:
             lines.append(f"证书剩余 '{format_days(ssl_info['days_left'])}'")
 
+        if info.get("reachable"):
+            features = []
+            encoding = (info.get("content_encoding") or "").lower()
+            features.append("压缩 " + (encoding or "无"))
+            features.append("移动适配 " + ("有" if info.get("has_viewport") else "无"))
+            features.append(f"安全头 {info.get('security_headers', 0)}/4")
+            if info.get("looks_like_error_page"):
+                features.append(f"疑似错误页（{info.get('error_hint') or '内容异常'}）")
+            lines.append("页面特征 '" + " · ".join(features) + "'")
+
         if not info.get("reachable"):
             lines.append("⚠️ 站点当前无法访问，以上部分信息可能缺失")
 
@@ -1538,13 +1814,25 @@ class QQProfilePlugin(Star):
             yield event.plain_result("❌ 数据严重不足，暂时无法给出评价。")
             return
 
+        # 先取上次记录再写入，才能算出本次的变化
+        history = await self._load_history(domain)
+        previous = history[-1] if history else None
+
         full = int(score)
         half = 1 if score - full >= 0.3 else 0
         stars = "⭐" * full + ("✨" if half else "") + "☆" * max(0, 5 - full - half)
 
+        header = f"{stars} {score}/5.0    数据覆盖 {int(coverage * 100)}%"
+        if previous:
+            delta = self._describe_delta(previous, score)
+            if delta:
+                header += f"    {delta}"
+        else:
+            header += "    首次评价，已记录基线"
+
         lines = [
             f"📊 网站评价 · {site.get('name', domain)}",
-            f"{stars} {score}/5.0    数据覆盖 {int(coverage * 100)}%",
+            header,
             "",
         ]
         weak: list[str] = []
@@ -1563,7 +1851,16 @@ class QQProfilePlugin(Star):
         lines.append(self._grade_text(score))
         if weak:
             lines.append("待改进：" + "、".join(weak))
+
+        tips = self._suggestions(rows, info)
+        if tips:
+            lines.append("")
+            lines.append("建议：")
+            for index, tip in enumerate(tips, 1):
+                lines.append(f"{index}. {tip}")
+
         if coverage < 0.75:
+            lines.append("")
             lines.append(
                 f"注：仅取到 {int(coverage * 100)}% 的指标，分数已按覆盖率向 3.0 收敛，"
                 "配置 WHOIS 密钥可获得更准确的评分。"
@@ -1571,6 +1868,7 @@ class QQProfilePlugin(Star):
 
         yield event.plain_result("\n".join(lines))
         await self._save_ranking(domain, site.get("name", domain), score, coverage)
+        await self._push_history(domain, score, coverage, rows)
 
     # ------------------------------------------------------------------ #
     # 命令：排行
