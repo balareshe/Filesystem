@@ -1,11 +1,15 @@
 name: astrbot_plugin_qq_profile
 display_name: 用户档案系统
-desc: 在QQ群内管理用户的档案信息。支持 /绑定账号、/查询档案、/绑定网站、/更新网站、/解绑网站、/删除档案、/查询备案、/查询证书 等命令。
-short_desc: 用户档案管理 — 绑定账号 / 查询档案 / 绑定网站
-version: v1.5.0
+desc: >-
+  在 QQ 群内管理用户档案：绑定账号后可为档案绑定一个网站，并查询域名的
+  WHOIS、存活状态、响应延迟、服务器归属地、ICP 备案与 SSL 证书，
+  最后按六维加权模型给出 5 分制评分并生成排行榜。
+  支持 /绑定账号、/查询档案、/绑定网站、/更新网站、/解绑网站、
+  /查询域名、/查询备案、/查询证书、/删除档案、/评价、/排行 等命令。
+short_desc: 用户档案管理 — 绑定账号 / 查询档案 / 绑定网站 / 域名六维评分
+version: 1.5.0
 author: 摆烂人生
 repo: https://github.com/balareshe/Filesystem
-logo: logo.png
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.16"

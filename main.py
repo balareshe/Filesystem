@@ -1,55 +1,199 @@
+"""用户档案系统（astrbot_plugin_qq_profile）。
+
+在 QQ 内管理用户档案：绑定账号 → 绑定网站 → 查询域名/备案/证书 → 评价 → 排行。
+
+数据全部存放在 AstrBot 插件维度的 KV 存储里，键名如下（v1.x 保持一致，升级不丢数据）：
+    profile_{QQ}          JSON 字符串，档案本体
+    _domain_{域名}        QQ 号，域名独占锁
+    _user_group_{QQ}      group_id，私聊时推断"上次所在群"
+    _next_profile_id      自增编号
+    _rankings             JSON 数组，评价榜单
+
+v1.5.0 主要变更：
+    * 域名归一化（小写、去 www、拒绝 IP 字面量与内网域名），修复独占锁可被绕过
+    * 评价体系重做：6 个维度加权 + 动态分母 + 覆盖率收敛，解决"人人 4.8 分"
+    * 域名/证书/HTTP 并发探测 + 结果缓存，避免串行 40 秒和第三方限流
+    * 免密钥 SSL 直连兜底、SSRF 防护、异常进日志、文案与实现对齐
+"""
+
 import asyncio
+import html as _html
 import json
 import re
+import socket
+import ssl as _ssl
 import time
 from datetime import datetime, timezone
+from ipaddress import ip_address
 
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star
+import aiohttp
+from aiohttp import ClientTimeout
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At
+from astrbot.api.star import Context, Star
 
-SITE_TYPES = {"博客", "企业", "个人", "商城", "论坛", "其他"}
+SITE_TYPES = ("博客", "企业", "个人", "商城", "论坛", "其他")
 
-DOMAIN_REGEX = r"^[a-zA-Z0-9\u4e00-\u9fff][-a-zA-Z0-9\u4e00-\u9fff]*(\.[a-zA-Z0-9\u4e00-\u9fff][-a-zA-Z0-9\u4e00-\u9fff]*)+$"
+# 只接受「标签.一级域」形式的纯主机名；IP 字面量在 normalize_domain 里单独拒绝
+RE_DOMAIN = re.compile(
+    r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+)
 
+# 不允许绑定的内部/保留后缀，避免机器人被当成内网探测器
+BLOCKED_SUFFIXES = (
+    ".local", ".localhost", ".internal", ".intranet", ".lan", ".home",
+    ".corp", ".test", ".example", ".invalid", ".arpa",
+)
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+CACHE_TTL = 600          # 域名探测结果缓存秒数
+CACHE_MAX = 256          # 缓存条目上限
+
+# 评价维度：(内部键, 展示名, 权重)。权重合计 100。
+DIMENSIONS = (
+    ("availability", "可用性", 30),
+    ("domain_expiry", "域名有效期", 20),
+    ("ssl", "SSL 证书", 20),
+    ("latency", "响应速度", 10),
+    ("domain_age", "域名年龄", 10),
+    ("content", "内容质量", 10),
+)
+TOTAL_WEIGHT = sum(w for _, _, w in DIMENSIONS)
+
+
+# --------------------------------------------------------------------------- #
+# 纯函数工具
+# --------------------------------------------------------------------------- #
+
+def normalize_domain(raw: str) -> str | None:
+    """把用户输入的域名规范化，非法或危险输入返回 None。
+
+    归一化让小写/大写、带不带 www、结尾带不带点 都指向同一个字符串，
+    否则 _domain_ 独占锁可以被绕过（Example.com 与 example.com 会当成两个）。
+    """
+    domain = (raw or "").strip().lower().rstrip(".")
+    if not domain:
+        return None
+    if domain.startswith("www.") and domain.count(".") >= 2:
+        domain = domain[4:]
+    # 拒绝 127.0.0.1 / 192.168.1.1 / ::1 这类 IP 字面量
+    try:
+        ip_address(domain)
+        return None
+    except ValueError:
+        pass
+    if not RE_DOMAIN.match(domain):
+        return None
+    if any(domain.endswith(suffix) for suffix in BLOCKED_SUFFIXES):
+        return None
+    return domain
+
+
+def format_days(days: int | None) -> str:
+    """把天数格式化成「x年x个月 / x个月 / x天」。"""
+    if days is None:
+        return "未知"
+    if days >= 365:
+        years, rest = days // 365, days % 365
+        if rest >= 30:
+            return f"{years}年{rest // 30}个月"
+        return f"{years}年"
+    if days >= 30:
+        return f"{days // 30}个月"
+    return f"{days}天"
+
+
+def extract_title(html_text: str) -> str | None:
+    """从 HTML 里抠 <title>，解实体（&#8211; 之类），并去掉「站点名 – 副标题」的尾巴。"""
+    match = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    # 实体不解码的话会得到 "摆烂的小站 &#8211; balareshe" 这种脏标题
+    title = _html.unescape(match.group(1))
+    title = re.sub(r"\s+", " ", title).strip()
+    for sep in (" - ", " – ", " — ", " | ", " :: ", " » ", "_", "－"):
+        if sep in title:
+            title = title.split(sep)[0].strip()
+            break
+    return title or None
+
+
+def ratio_level(ratio: float | None) -> str:
+    """分数区间 → 图标。"""
+    if ratio is None:
+        return "➖"
+    if ratio >= 0.75:
+        return "✅"
+    if ratio >= 0.4:
+        return "⚪"
+    return "🔴"
+
+
+def bar(ratio: float, width: int = 5) -> str:
+    filled = max(0, min(width, round(ratio * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def parse_iso_date(value) -> datetime | None:
+    """尽力从字符串里解析出 UTC 日期，失败返回 None。"""
+    if not value:
+        return None
+    text = str(value).strip()
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if not match:
+        return None
+    try:
+        return datetime(
+            int(match.group(1)), int(match.group(2)), int(match.group(3)),
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# 插件主体
+# --------------------------------------------------------------------------- #
 
 class QQProfilePlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.plugin_id = "astrbot_plugin_qq_profile"
-        self.admin_ids: list[str] = []
-        self.whois_api_key: str = ""
-        self.ssl_api_key: str = ""
-        self.icp_api_key: str = ""
-        if config:
-            try:
-                raw = config.get("admin_ids", [])
-                if isinstance(raw, list):
-                    self.admin_ids = [
-                        str(x).strip() for x in raw if str(x).strip()
-                    ]
-            except Exception:
-                self.admin_ids = []
-            try:
-                self.whois_api_key = str(config.get("whois_api_key", "") or "").strip()
-            except Exception:
-                self.whois_api_key = ""
-            try:
-                self.ssl_api_key = str(config.get("ssl_api_key", "") or "").strip()
-            except Exception:
-                self.ssl_api_key = ""
-            try:
-                self.icp_api_key = str(config.get("icp_api_key", "") or "").strip()
-            except Exception:
-                self.icp_api_key = ""
+        config = config or {}
 
+        self.admin_ids: list[str] = []
+        raw_admins = config.get("admin_ids", [])
+        if isinstance(raw_admins, list):
+            self.admin_ids = [str(x).strip() for x in raw_admins if str(x).strip()]
+
+        self.whois_api_key: str = str(config.get("whois_api_key", "") or "").strip()
+        self.ssl_api_key: str = str(config.get("ssl_api_key", "") or "").strip()
+        self.icp_api_key: str = str(config.get("icp_api_key", "") or "").strip()
+
+        # 自增编号的进程内互斥，避免并发绑定撞号
+        self._id_lock = asyncio.Lock()
+        # 域名探测结果缓存：{domain: (写入时间戳, info dict)}
+        self._cache: dict[str, tuple[float, dict]] = {}
+
+    # ------------------------------------------------------------------ #
     # 数据管理（全局统一存储）
+    # ------------------------------------------------------------------ #
 
     async def _get_profile(self, qq: str) -> dict | None:
         raw = await self.get_kv_data(f"profile_{qq}", None)
         if raw is None:
             return None
-        profile = json.loads(raw) if isinstance(raw, str) else raw
+        try:
+            profile = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            logger.warning(f"[qq_profile] 档案 {qq} 解析失败，已忽略损坏数据")
+            return None
         return profile if isinstance(profile, dict) else None
 
     async def _save_profile(self, qq: str, profile: dict) -> None:
@@ -61,28 +205,20 @@ class QQProfilePlugin(Star):
     async def _record_last_group(self, qq: str, group_id: str) -> None:
         await self.put_kv_data(f"_user_group_{qq}", group_id)
 
-    async def _get_next_id(self) -> str:
-        key = "_next_profile_id"
-        raw = await self.get_kv_data(key, "0")
-        current = int(raw) if str(raw).isdigit() else 0
-        next_id = current + 1
-        await self.put_kv_data(key, str(next_id))
-        return str(next_id)
-
     async def _get_last_group(self, qq: str) -> str | None:
         raw = await self.get_kv_data(f"_user_group_{qq}", None)
         return str(raw) if raw else None
 
-    @staticmethod
-    def _normalize_domain(domain: str) -> str:
-        try:
-            return domain.encode("idna").decode("ascii")
-        except Exception:
-            return domain
+    async def _get_next_id(self) -> str:
+        async with self._id_lock:
+            raw = await self.get_kv_data("_next_profile_id", "0")
+            current = int(raw) if str(raw).isdigit() else 0
+            next_id = current + 1
+            await self.put_kv_data("_next_profile_id", str(next_id))
+            return str(next_id)
 
     async def _check_domain_owner(self, domain: str, exclude_qq: str = "") -> dict | None:
-        key = self._normalize_domain(domain)
-        raw = await self.get_kv_data(f"_domain_{key}", None)
+        raw = await self.get_kv_data(f"_domain_{domain}", None)
         if raw is None:
             return None
         qq = str(raw)
@@ -90,56 +226,97 @@ class QQProfilePlugin(Star):
             return None
         return await self._get_profile(qq)
 
+    async def _release_domain(self, domain: str, qq: str) -> None:
+        """解绑/删除档案时释放域名锁，且不误删别人的锁。"""
+        if not domain:
+            return
+        raw = await self.get_kv_data(f"_domain_{domain}", None)
+        if raw is not None and str(raw) == str(qq):
+            await self.delete_kv_data(f"_domain_{domain}")
+
     async def _resolve_group_id(self, event: AstrMessageEvent) -> str | None:
-        gid = event.get_group_id()
-        if gid:
-            return gid
+        group_id = event.get_group_id()
+        if group_id:
+            return group_id
         return await self._get_last_group(event.get_sender_id())
 
-    # 权限 & 辅助
+    # ------------------------------------------------------------------ #
+    # 权限与事件辅助
+    # ------------------------------------------------------------------ #
 
     async def _get_group_role(self, event: AstrMessageEvent) -> str:
-        sender_id = event.get_sender_id()
+        sender_id = str(event.get_sender_id())
         try:
             group_info = await event.get_group()
             if group_info:
-                sid = str(sender_id)
-                if group_info.group_owner and str(group_info.group_owner) == sid:
+                owner = getattr(group_info, "group_owner", None)
+                admins = getattr(group_info, "group_admins", None) or []
+                if owner and str(owner) == sender_id:
                     return "群主"
-                if group_info.group_admins and sid in [str(a) for a in group_info.group_admins]:
+                if sender_id in {str(a) for a in admins}:
                     return "管理员"
                 return "成员"
-        except Exception:
-            pass
-        if event.is_admin():
-            return "管理员"
+        except Exception as exc:  # 平台不支持取群资料时静默降级
+            logger.debug(f"[qq_profile] 获取群身份失败: {exc!r}")
+        try:
+            if event.is_admin():
+                return "管理员"
+        except Exception as exc:
+            logger.debug(f"[qq_profile] event.is_admin() 不可用: {exc!r}")
         return "成员"
 
     async def _is_admin(self, event: AstrMessageEvent) -> bool:
-        return event.get_sender_id() in self.admin_ids
+        """只认插件配置里的 admin_ids 白名单，群主/群管理不算。"""
+        return str(event.get_sender_id()) in self.admin_ids
 
     def _get_at_qq(self, event: AstrMessageEvent) -> str | None:
-        for comp in event.get_messages():
+        # 优先用文档写明的 message_obj.message，回退到 get_messages()
+        chain = getattr(getattr(event, "message_obj", None), "message", None)
+        if not chain:
+            try:
+                chain = event.get_messages()
+            except Exception:
+                chain = None
+        for comp in chain or []:
             if isinstance(comp, At) and str(comp.qq) != "all":
                 return str(comp.qq)
         return None
 
+    @staticmethod
+    def _message_text(event: AstrMessageEvent) -> str:
+        text = getattr(event, "message_str", None)
+        if text is None:
+            try:
+                text = event.get_message_str()
+            except Exception:
+                text = ""
+        return (text or "").strip()
+
+    @staticmethod
+    def _now_utc() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # ------------------------------------------------------------------ #
     # 消息格式化
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _format_basic_info(
-        profile: dict, index: int,
+        profile: dict,
+        index: int = 1,
         group_role: str | None = None,
         group_id: str | None = None,
     ) -> str:
         pid = profile.get("id", str(index))
+        role = group_role or profile.get("groupRole", "未知")
+        gid = group_id or profile.get("groupId", "未知")
         return (
             "# 基础信息\n"
             f"编号 '{pid}'\n"
-            f"QQ号 '{profile['qq']}'\n"
-            f"用户名 '{profile['username']}'\n"
-            f"群身份 '{group_role or profile['groupRole']}'\n"
-            f"所在群 '{group_id or profile['groupId']}'"
+            f"QQ号 '{profile.get('qq', '未知')}'\n"
+            f"用户名 '{profile.get('username', '未知')}'\n"
+            f"群身份 '{role}'\n"
+            f"所在群 '{gid}'"
         )
 
     @staticmethod
@@ -149,102 +326,610 @@ class QQProfilePlugin(Star):
             return ""
         result = (
             "\n\n# 站点信息\n"
-            f"网站名称 '{site['name']}'\n"
-            f"网站类型 '{site['type']}'\n"
-            f"网站域名 '{site['domain']}'"
+            f"网站名称 '{site.get('name', '')}'\n"
+            f"网站类型 '{site.get('type', '')}'\n"
+            f"网站域名 '{site.get('domain', '')}'"
         )
         icp = site.get("icp_licence", "")
         if icp:
             result += f"\n备案信息 '{icp}'"
         return result
 
-    @staticmethod
-    def _now_utc() -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # ------------------------------------------------------------------ #
+    # 缓存
+    # ------------------------------------------------------------------ #
 
-    # 命令：/hda（帮助）
+    def _cache_get(self, key: str) -> dict | None:
+        item = self._cache.get(key)
+        if not item:
+            return None
+        stamp, value = item
+        if time.time() - stamp > CACHE_TTL:
+            self._cache.pop(key, None)
+            return None
+        return value
+
+    def _cache_put(self, key: str, value: dict) -> None:
+        if len(self._cache) >= CACHE_MAX:
+            oldest = min(self._cache, key=lambda k: self._cache[k][0])
+            self._cache.pop(oldest, None)
+        self._cache[key] = (time.time(), value)
+
+    # ------------------------------------------------------------------ #
+    # 网络探测
+    # ------------------------------------------------------------------ #
+
+    async def _resolve_public_ip(self, domain: str) -> str | None:
+        """解析域名，且要求所有解析结果都是公网地址（防 SSRF）。"""
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await asyncio.wait_for(
+                loop.run_in_executor(None, socket.getaddrinfo, domain, None),
+                timeout=6,
+            )
+        except Exception as exc:
+            logger.info(f"[qq_profile] DNS 解析失败 {domain}: {exc!r}")
+            return None
+
+        public: list[str] = []
+        for info in infos:
+            candidate = info[4][0]
+            try:
+                addr = ip_address(candidate)
+            except ValueError:
+                continue
+            if (
+                addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified
+            ):
+                logger.warning(
+                    f"[qq_profile] 拒绝访问 {domain}：解析到内网地址 {candidate}"
+                )
+                return None
+            public.append(str(addr))
+        return public[0] if public else None
+
+    async def _probe_http(self, domain: str) -> dict:
+        """抓 HTTP 状态、延迟、Server 头、页面标题，并判定 HTTPS 是否可用。"""
+        result = {
+            "status": None, "latency_ms": None, "server": "",
+            "title": None, "https_ok": False, "scheme": None, "reachable": False,
+        }
+        timeout = ClientTimeout(total=10)
+        async with aiohttp.ClientSession(
+            timeout=timeout, headers={"User-Agent": UA}
+        ) as session:
+            for scheme in ("https", "http"):
+                if result["reachable"]:
+                    break
+                try:
+                    started = time.perf_counter()
+                    async with session.get(
+                        f"{scheme}://{domain}", allow_redirects=True
+                    ) as resp:
+                        raw = await resp.content.read(200_000)
+                        elapsed = int((time.perf_counter() - started) * 1000)
+                        body = raw.decode("utf-8", "ignore")
+                        result.update(
+                            status=resp.status,
+                            latency_ms=elapsed,
+                            server=resp.headers.get("Server", "") or "",
+                            title=extract_title(body),
+                            scheme=scheme,
+                            reachable=True,
+                        )
+                        if scheme == "https" and 200 <= resp.status < 400:
+                            result["https_ok"] = True
+                except Exception as exc:
+                    logger.debug(f"[qq_profile] {scheme}://{domain} 探测失败: {exc!r}")
+        return result
+
+    async def _fetch_geo(self, ip: str) -> str | None:
+        try:
+            async with aiohttp.ClientSession(
+                timeout=ClientTimeout(total=5), headers={"User-Agent": UA}
+            ) as session:
+                async with session.get(
+                    f"http://ip-api.com/json/{ip}?lang=zh-CN&fields=country,regionName,city"
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json(content_type=None)
+            parts = [
+                data.get("country", ""),
+                data.get("regionName", ""),
+                data.get("city", ""),
+            ]
+            location = " ".join(p for p in parts if p)
+            return location or None
+        except Exception as exc:
+            logger.info(f"[qq_profile] IP 归属地查询失败 {ip}: {exc!r}")
+            return None
+
+    async def _fetch_whois_info(self, domain: str) -> dict:
+        """自建 WHOIS API。未配置密钥时返回空结果，不影响其他指标。"""
+        info: dict = {}
+        if not self.whois_api_key:
+            return info
+        try:
+            async with aiohttp.ClientSession(
+                timeout=ClientTimeout(total=10), headers={"User-Agent": UA}
+            ) as session:
+                async with session.get(
+                    f"https://whois.blid.top/{domain}",
+                    headers={"Authorization": f"Bearer {self.whois_api_key}"},
+                ) as resp:
+                    if resp.status != 200:
+                        logger.info(
+                            f"[qq_profile] WHOIS API 返回 {resp.status}（{domain}）"
+                        )
+                        return info
+                    data = await resp.json(content_type=None)
+            if not data.get("isRegistered"):
+                return info
+            info["registrar"] = (data.get("registrar") or {}).get("name")
+            dates = data.get("dates") or {}
+            for source_key, target_key in (
+                ("created", "creation_date"),
+                ("expires", "expiration_date"),
+                ("updated", "updated_date"),
+            ):
+                value = dates.get(source_key)
+                if value:
+                    info[target_key] = str(value)[:10]
+            created = parse_iso_date(info.get("creation_date"))
+            if created:
+                info["domain_age_days"] = max(
+                    0, (datetime.now(timezone.utc) - created).days
+                )
+            expires = parse_iso_date(info.get("expiration_date"))
+            if expires:
+                info["domain_days_left"] = max(
+                    0, (expires - datetime.now(timezone.utc)).days
+                )
+        except Exception as exc:
+            logger.warning(f"[qq_profile] WHOIS 查询异常 {domain}: {exc!r}")
+        return info
+
+    async def _fetch_ssl_info(self, domain: str) -> dict:
+        """SSL 证书信息：先免密钥直连（还能拿到 issuer / SAN），失败再走 API。"""
+        info: dict = {
+            "days_left": None, "expiry": None, "not_before": None,
+            "issuer": None, "san": [], "source": None, "state": "error",
+        }
+
+        # ① 直连 443，免密钥
+        try:
+            loop = asyncio.get_running_loop()
+            pem = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: _ssl.get_server_certificate((domain, 443))
+                ),
+                timeout=12,
+            )
+            info["state"] = "ok"
+            info["source"] = "直连"
+        except asyncio.TimeoutError:
+            logger.info(f"[qq_profile] SSL 直连超时 {domain}")
+            info["state"] = "timeout"
+            pem = None
+        except ConnectionRefusedError:
+            info["state"] = "refused"
+            pem = None
+        except Exception as exc:
+            logger.info(f"[qq_profile] SSL 直连失败 {domain}: {exc!r}")
+            info["state"] = "error"
+            pem = None
+
+        if pem:
+            try:
+                from cryptography import x509
+                from cryptography.hazmat.backends import default_backend
+                from cryptography.x509.oid import NameOID
+
+                cert = x509.load_pem_x509_certificate(pem.encode(), default_backend())
+                not_after = getattr(cert, "not_valid_after_utc", None)
+                if not_after is None:  # cryptography < 42
+                    not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
+                not_before = getattr(cert, "not_valid_before_utc", None)
+                if not_before is None:
+                    not_before = cert.not_valid_before.replace(tzinfo=timezone.utc)
+
+                now = datetime.now(timezone.utc)
+                info["days_left"] = max(0, (not_after - now).days)
+                info["expiry"] = not_after.strftime("%Y-%m-%d")
+                info["not_before"] = not_before.strftime("%Y-%m-%d")
+
+                def _attr(name_oid) -> str:
+                    attrs = cert.issuer.get_attributes_for_oid(name_oid)
+                    return str(attrs[0].value) if attrs else ""
+
+                # 注意：cryptography 里叫 ORGANIZATION_NAME，没有 ORGANIZATION
+                info["issuer"] = (
+                    _attr(NameOID.ORGANIZATION_NAME) or _attr(NameOID.COMMON_NAME)
+                )
+                try:
+                    san_ext = cert.extensions.get_extension_for_class(
+                        x509.SubjectAlternativeName
+                    )
+                    info["san"] = list(
+                        san_ext.value.get_values_for_type(x509.DNSName)
+                    )
+                except Exception:
+                    pass
+                info["source"] = "直连"
+            except ImportError:
+                logger.warning(
+                    "[qq_profile] 未安装 cryptography，SSL 直连结果无法解析；"
+                    "请在 requirements.txt 里补上 cryptography"
+                )
+            except Exception as exc:
+                logger.warning(f"[qq_profile] 证书解析失败 {domain}: {exc!r}")
+
+        # ② API 兜底
+        if info["days_left"] is None and self.ssl_api_key:
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=ClientTimeout(total=10), headers={"User-Agent": UA}
+                ) as session:
+                    async with session.get(
+                        f"https://ssl.blid.top/ssl/{domain}",
+                        headers={"Authorization": f"Bearer {self.ssl_api_key}"},
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(content_type=None)
+                            current = data.get("current_certificate") or {}
+                            days = current.get("days_remaining")
+                            if days is not None:
+                                info["days_left"] = int(days)
+                            issuer = current.get("issuer") or {}
+                            info["issuer"] = (
+                                issuer.get("common_name")
+                                or issuer.get("organization")
+                                or info["issuer"]
+                            )
+                            not_after = current.get("not_after")
+                            if not_after:
+                                info["not_before"] = current.get("not_before")
+                                date = parse_iso_date(not_after)
+                                if date:
+                                    info["expiry"] = date.strftime("%Y-%m-%d")
+                                    if info["days_left"] is None:
+                                        info["days_left"] = max(
+                                            0,
+                                            (date - datetime.now(timezone.utc)).days,
+                                        )
+                            san = current.get("san") or []
+                            if san:
+                                info["san"] = list(san)
+                            info["source"] = "API"
+                            info["state"] = "ok"
+                        else:
+                            logger.info(
+                                f"[qq_profile] SSL API 返回 {resp.status}（{domain}）"
+                            )
+            except Exception as exc:
+                logger.warning(f"[qq_profile] SSL API 异常 {domain}: {exc!r}")
+
+        return info
+
+    async def _fetch_domain_info(self, domain: str) -> dict:
+        """并发拿到一个域名的全部实时信息，结果缓存 10 分钟。"""
+        cached = self._cache_get(f"domain:{domain}")
+        if cached is not None:
+            return cached
+
+        ip = await self._resolve_public_ip(domain)
+        info: dict = {
+            "domain": domain,
+            "ip": ip,
+            "location": None,
+            "status": None,
+            "latency_ms": None,
+            "server": "",
+            "title": None,
+            "reachable": False,
+            "https_ok": False,
+            "registrar": None,
+            "creation_date": None,
+            "expiration_date": None,
+            "updated_date": None,
+            "domain_age_days": None,
+            "domain_days_left": None,
+            "ssl": {"days_left": None, "state": "error", "source": None},
+            "error": None,
+            "fetched_at": self._now_utc(),
+        }
+
+        if ip is None:
+            info["error"] = "dns"
+            info["ssl"] = await self._fetch_ssl_info(domain)
+            self._cache_put(f"domain:{domain}", info)
+            return info
+
+        geo_task = asyncio.create_task(self._fetch_geo(ip))
+        http_task = asyncio.create_task(self._probe_http(domain))
+        ssl_task = asyncio.create_task(self._fetch_ssl_info(domain))
+        whois_task = asyncio.create_task(self._fetch_whois_info(domain))
+
+        location, http_result, ssl_result, whois_result = await asyncio.gather(
+            geo_task, http_task, ssl_task, whois_task, return_exceptions=True
+        )
+
+        def _unwrap(value, label):
+            if isinstance(value, BaseException):
+                logger.warning(f"[qq_profile] {label} 探测异常: {value!r}")
+                return {}
+            return value
+
+        location = _unwrap(location, "归属地")
+        http_result = _unwrap(http_result, "HTTP")
+        ssl_result = _unwrap(ssl_result, "SSL")
+        whois_result = _unwrap(whois_result, "WHOIS")
+
+        info["location"] = location or None
+        info.update(
+            {
+                "status": http_result.get("status"),
+                "latency_ms": http_result.get("latency_ms"),
+                "server": http_result.get("server", ""),
+                "title": http_result.get("title"),
+                "reachable": http_result.get("reachable", False),
+                "https_ok": http_result.get("https_ok", False),
+            }
+        )
+        info["ssl"] = ssl_result or {"days_left": None, "state": "error", "source": None}
+        info.update(whois_result)
+
+        self._cache_put(f"domain:{domain}", info)
+        return info
+
+    # ------------------------------------------------------------------ #
+    # 评价算法
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _dimension_ratios(info: dict) -> list[tuple[str, str, int, float | None, str]]:
+        """把原始数据折算成 0~1 的维度比例，返回 (键, 名称, 权重, 比例|None, 说明)。
+
+        比例为 None 表示"这批数据没拿到"，不参与分母，也不扣分。
+        """
+        rows: list[tuple[str, str, int, float | None, str]] = []
+        status = info.get("status")
+        latency = info.get("latency_ms")
+        https_ok = bool(info.get("https_ok"))
+
+        # 1. 可用性：响应状态 80% + HTTPS 可用 20%
+        if not info.get("reachable") or status is None:
+            availability = 0.0
+            note = "站点无法访问"
+        else:
+            if 200 <= status < 300:
+                base = 1.0
+            elif 300 <= status < 400:
+                base = 0.85
+            elif 400 <= status < 500:
+                base = 0.35
+            else:
+                base = 0.2
+            availability = base * 0.8 + (0.2 if https_ok else 0.0)
+            note = f"HTTP {status} · {latency}ms · {'HTTPS 正常' if https_ok else '仅 HTTP 可用'}"
+        rows.append(("availability", "可用性", 30, availability, note))
+
+        # 2. 域名有效期
+        days_left = info.get("domain_days_left")
+        if days_left is None:
+            rows.append(("domain_expiry", "域名有效期", 20, None, "未获取到期时间"))
+        else:
+            if days_left >= 730:
+                ratio = 1.0
+            elif days_left >= 365:
+                ratio = 0.9
+            elif days_left >= 180:
+                ratio = 0.75
+            elif days_left >= 90:
+                ratio = 0.55
+            elif days_left >= 30:
+                ratio = 0.3
+            elif days_left >= 7:
+                ratio = 0.1
+            else:
+                ratio = 0.0
+            expiry = info.get("expiration_date") or ""
+            rows.append(
+                ("domain_expiry", "域名有效期", 20, ratio,
+                 f"剩余 {format_days(days_left)}" + (f"（{expiry} 到期）" if expiry else ""))
+            )
+
+        # 3. SSL 证书
+        ssl_info = info.get("ssl") or {}
+        ssl_days = ssl_info.get("days_left")
+        ssl_state = ssl_info.get("state", "error")
+        if ssl_days is not None:
+            if ssl_days >= 365:
+                ratio = 1.0
+            elif ssl_days >= 180:
+                ratio = 0.95
+            elif ssl_days >= 90:
+                ratio = 0.85
+            elif ssl_days >= 30:
+                ratio = 0.6
+            elif ssl_days >= 7:
+                ratio = 0.3
+            elif ssl_days > 0:
+                ratio = 0.1
+            else:
+                ratio = 0.0
+            source = ssl_info.get("source") or "直连"
+            rows.append(
+                ("ssl", "SSL 证书", 20, ratio,
+                 f"剩余 {format_days(ssl_days)}（{source}）")
+            )
+        elif ssl_state in ("timeout", "error"):
+            # 网络原因导致没测到，不给 0 分，直接不计入分母
+            rows.append(("ssl", "SSL 证书", 20, None, "证书检测未完成"))
+        else:
+            rows.append(("ssl", "SSL 证书", 20, 0.0, "443 端口无可用证书"))
+
+        # 4. 响应速度
+        if latency is None:
+            rows.append(("latency", "响应速度", 10, None, "未获取响应时间"))
+        else:
+            if latency <= 300:
+                ratio = 1.0
+            elif latency <= 600:
+                ratio = 0.9
+            elif latency <= 1000:
+                ratio = 0.75
+            elif latency <= 2000:
+                ratio = 0.5
+            elif latency <= 4000:
+                ratio = 0.25
+            else:
+                ratio = 0.1
+            rows.append(("latency", "响应速度", 10, ratio, f"{latency}ms"))
+
+        # 5. 域名年龄
+        age_days = info.get("domain_age_days")
+        if age_days is None:
+            rows.append(("domain_age", "域名年龄", 10, None, "未获取注册时间"))
+        else:
+            if age_days >= 1825:
+                ratio = 1.0
+            elif age_days >= 1095:
+                ratio = 0.85
+            elif age_days >= 365:
+                ratio = 0.7
+            elif age_days >= 180:
+                ratio = 0.5
+            elif age_days >= 30:
+                ratio = 0.25
+            else:
+                ratio = 0.1
+            rows.append(
+                ("domain_age", "域名年龄", 10, ratio, f"已注册 {format_days(age_days)}")
+            )
+
+        # 6. 内容质量：标题
+        title = info.get("title")
+        if not title:
+            # 站点根本没响应时谈不上"标题质量差"，按无数据处理
+            rows.append((
+                "content", "内容质量", 10,
+                None if not info.get("reachable") else 0.0,
+                "未取到页面标题",
+            ))
+        else:
+            length = len(title)
+            if length >= 10:
+                ratio = 1.0
+            elif length >= 6:
+                ratio = 0.85
+            elif length >= 4:
+                ratio = 0.65
+            else:
+                ratio = 0.4
+            rows.append(
+                ("content", "内容质量", 10, ratio, f"标题「{title[:24]}」")
+            )
+
+        return rows
+
+    @staticmethod
+    def _final_score(rows) -> tuple[float, float]:
+        """加权平均 + 覆盖率收敛，返回 (5 分制得分, 数据覆盖率 0~1)。
+
+        覆盖率低时把分数往 3.0 拉，避免"只测到可用性就 5.0 分"的假高分。
+        """
+        got_weight = sum(w for _, _, w, ratio, _ in rows if ratio is not None)
+        if got_weight == 0:
+            return 0.0, 0.0
+        weighted = sum(w * ratio for _, _, w, ratio, _ in rows if ratio is not None)
+        raw = weighted / got_weight
+        coverage = got_weight / TOTAL_WEIGHT
+        final = raw * coverage + 0.6 * (1 - coverage)
+        return round(min(5.0, final * 5), 1), round(coverage, 2)
+
+    @staticmethod
+    def _grade_text(score: float) -> str:
+        if score >= 4.5:
+            return "非常优秀的网站，各方面表现出色。"
+        if score >= 3.8:
+            return "整体表现良好，可继续打磨细节。"
+        if score >= 3.0:
+            return "中规中矩，部分指标有提升空间。"
+        if score >= 2.0:
+            return "存在明显短板，建议检查域名与证书状态。"
+        return "网站状态较差，多项指标异常，需要排查。"
+
+    # ------------------------------------------------------------------ #
+    # 榜单
+    # ------------------------------------------------------------------ #
+
+    async def _get_rankings(self) -> list[dict]:
+        raw = await self.get_kv_data("_rankings", None)
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                logger.warning("[qq_profile] 排行榜数据损坏，已重置")
+                return []
+            return data if isinstance(data, list) else []
+        if isinstance(raw, list):
+            return raw
+        return []
+
+    async def _save_ranking(self, domain: str, name: str, score: float, coverage: float) -> None:
+        rankings = await self._get_rankings()
+        now = datetime.now(timezone.utc).isoformat()
+        for record in rankings:
+            if record.get("domain") == domain:
+                record.update(score=score, name=name, time=now, coverage=coverage)
+                break
+        else:
+            rankings.append(
+                {"domain": domain, "name": name, "score": score,
+                 "coverage": coverage, "time": now}
+            )
+        perfect = [r for r in rankings if r.get("score", 0) >= 5.0]
+        perfect.sort(key=lambda r: r.get("time", ""))
+        others = [r for r in rankings if r.get("score", 0) < 5.0]
+        others.sort(key=lambda r: (-r.get("score", 0), r.get("time", "")))
+        await self.put_kv_data(
+            "_rankings", json.dumps(perfect[-5:] + others, ensure_ascii=False)
+        )
+
+    # ------------------------------------------------------------------ #
+    # 命令：帮助
+    # ------------------------------------------------------------------ #
 
     @filter.command("hda")
     async def help_command(self, event: AstrMessageEvent):
-        uid = event.get_sender_id()
-        now = time.time()
-        last = await self.get_kv_data(f"_hda_cd_{uid}", "0")
-        if float(last) + 10 > now:
-            return
-        await self.put_kv_data(f"_hda_cd_{uid}", str(now))
+        """显示所有命令的说明。"""
         yield event.plain_result(
             "📋 用户档案系统 - 命令列表\n\n"
-            "/绑定账号   绑定账号创建档案\n"
-            "/查询档案   查询档案(管理可查他人)\n"
-            "/绑定网站   绑定网站信息\n"
-            "/更新网站   更新网站信息\n"
-            "/解绑网站   解绑网站信息\n"
-            "/查询域名   查询域名信息\n"
-            "/查询备案   查询域名ICP备案\n"
-            "/查询证书   查询域名SSL证书\n"
-            "/删除档案   删除用户档案(管理)\n"
-            "/评价       对网站进行综合评价\n"
-            "/排行       查看评价排行榜TOP12\n\n"
-            "/绑定网站 <域名> 自动获取信息"
+            "/绑定账号        在群内创建档案\n"
+            "/查询档案        查询档案（白名单管理员可 @ 查他人）\n"
+            "/绑定网站 域名        智能识别网站标题，类型默认「博客」\n"
+            "/绑定网站 名称 类型 域名  手动指定\n"
+            "/更新网站 名称 类型 域名  更新站点信息\n"
+            "/解绑网站        解绑网站，档案保留\n"
+            "/查询域名 [域名]   WHOIS / 存活 / 延迟 / 归属地\n"
+            "/查询备案 [域名]   ICP 备案信息\n"
+            "/查询证书 [域名]   SSL 证书信息\n"
+            "/评价            六维加权评分（5 分制）\n"
+            "/排行            评价榜 TOP12\n"
+            "/删除档案 @用户   删除档案（仅白名单管理员）\n\n"
+            "网站类型：" + "、".join(SITE_TYPES)
         )
 
-    # 命令：/查询档案
-
-    @filter.command("查询档案")
-    async def query_profile(self, event: AstrMessageEvent):
-        sender_id = event.get_sender_id()
-        group_id = event.get_group_id()
-
-        target_qq = self._get_at_qq(event)
-        is_query_other = target_qq is not None and target_qq != sender_id
-
-        if is_query_other:
-            if sender_id not in self.admin_ids:
-                yield event.plain_result("⛔ 只有管理员可以查询他人的档案。")
-                return
-            query_id = target_qq
-        else:
-            query_id = sender_id
-
-        if group_id:
-            await self._record_last_group(sender_id, group_id)
-            profile = await self._get_profile(query_id)
-            if not profile:
-                if is_query_other:
-                    yield event.plain_result("❌ 该用户暂无档案。")
-                else:
-                    yield event.plain_result("❌ 未找到您的档案，请先使用 `/绑定账号` 创建档案。")
-                return
-
-            if is_query_other:
-                result = self._format_basic_info(profile, 1)
-                result += self._format_site_info(profile)
-                yield event.plain_result(result)
-                return
-
-            group_role = await self._get_group_role(event)
-            result = self._format_basic_info(profile, 1, group_role, group_id)
-            result += self._format_site_info(profile)
-            yield event.plain_result(result)
-            return
-
-        if is_query_other:
-            yield event.plain_result("❌ 私聊无法查询他人档案。")
-            return
-
-        profile = await self._get_profile(query_id)
-        if not profile:
-            yield event.plain_result("❌ 未找到您的档案，请先在群内使用 `/绑定账号` 创建档案。")
-            return
-
-        result = self._format_basic_info(profile, 1)
-        result += self._format_site_info(profile)
-        yield event.plain_result(result)
-
-    # 命令：/绑定账号
+    # ------------------------------------------------------------------ #
+    # 命令：绑定账号
+    # ------------------------------------------------------------------ #
 
     @filter.command("绑定账号")
     async def bind_account(self, event: AstrMessageEvent):
+        """在群内创建用户档案。"""
         group_id = event.get_group_id()
         if not group_id:
             yield event.plain_result("❌ 绑定账号请在群内使用。")
@@ -270,9 +955,13 @@ class QQProfilePlugin(Star):
         now = self._now_utc()
         new_profile = {
             "id": await self._get_next_id(),
-            "qq": sender_id, "username": sender_name,
-            "groupId": group_id, "groupRole": group_role,
-            "site": None, "createdAt": now, "updatedAt": now,
+            "qq": sender_id,
+            "username": sender_name,
+            "groupId": group_id,
+            "groupRole": group_role,
+            "site": None,
+            "createdAt": now,
+            "updatedAt": now,
         }
         await self._save_profile(sender_id, new_profile)
         await self._record_last_group(sender_id, group_id)
@@ -281,231 +970,69 @@ class QQProfilePlugin(Star):
         result += self._format_basic_info(new_profile, 1)
         yield event.plain_result(result)
 
-    async def _fetch_website_title(self, domain: str) -> str | None:
-        import aiohttp
-        from aiohttp import ClientTimeout
+    # ------------------------------------------------------------------ #
+    # 命令：查询档案
+    # ------------------------------------------------------------------ #
 
-        for scheme in ("https", "http"):
-            url = f"{scheme}://{domain}"
-            try:
-                async with aiohttp.ClientSession(
-                    timeout=ClientTimeout(total=8)
-                ) as session:
-                    async with session.get(
-                        url, allow_redirects=True, ssl=False
-                    ) as resp:
-                        if resp.status != 200:
-                            continue
-                        html = await resp.text()
-                        match = re.search(
-                            r"<title[^>]*>(.*?)</title>",
-                            html,
-                            re.IGNORECASE | re.DOTALL,
-                        )
-                        if match:
-                            title = match.group(1).strip()
-                            title = re.sub(r"\s+", " ", title)
-                            for sep in (" - ", " – ", " — ", " | ", " :: ", " » "):
-                                if sep in title:
-                                    title = title.split(sep)[0].strip()
-                                    break
-                            if title:
-                                return title[:30]
-            except Exception:
-                continue
-        return None
+    @filter.command("查询档案")
+    async def query_profile(self, event: AstrMessageEvent):
+        """查询自己的档案；白名单管理员可以 @ 查他人。"""
+        sender_id = event.get_sender_id()
+        group_id = event.get_group_id()
+        target_qq = self._get_at_qq(event)
+        is_query_other = target_qq is not None and target_qq != sender_id
 
-    async def _fetch_domain_info(self, domain: str) -> dict:
-        domain = self._normalize_domain(domain)
-        import aiohttp
-        import socket
-        from aiohttp import ClientTimeout
+        if is_query_other:
+            if not await self._is_admin(event):
+                yield event.plain_result("⛔ 只有白名单管理员可以查询他人的档案。")
+                return
+            query_id = target_qq
+        else:
+            query_id = sender_id
 
-        info: dict = {
-            "title": None, "server": None, "status": None, "ip": None,
-            "location": None, "latency": None,
-            "registrar": None, "creation_date": None,
-            "expiration_date": None, "updated_date": None,
-            "domain_days_left": None,
-            "ssl_days_left": None, "ssl_expiry": None,
-        }
+        if group_id:
+            await self._record_last_group(sender_id, group_id)
+            profile = await self._get_profile(query_id)
+            if not profile:
+                if is_query_other:
+                    yield event.plain_result("❌ 该用户暂无档案。")
+                else:
+                    yield event.plain_result(
+                        "❌ 未找到您的档案，请先使用 `/绑定账号` 创建档案。"
+                    )
+                return
+            if is_query_other:
+                result = self._format_basic_info(profile, 1)
+                result += self._format_site_info(profile)
+                yield event.plain_result(result)
+                return
+            group_role = await self._get_group_role(event)
+            result = self._format_basic_info(profile, 1, group_role, group_id)
+            result += self._format_site_info(profile)
+            yield event.plain_result(result)
+            return
 
-        try:
-            loop = asyncio.get_event_loop()
-            addr = await loop.run_in_executor(
-                None, socket.getaddrinfo, domain, 80
+        if is_query_other:
+            yield event.plain_result("❌ 私聊无法查询他人档案。")
+            return
+
+        profile = await self._get_profile(query_id)
+        if not profile:
+            yield event.plain_result(
+                "❌ 未找到您的档案，请先在群内使用 `/绑定账号` 创建档案。"
             )
-            if addr:
-                ip = addr[0][4][0]
-                info["ip"] = ip
-                try:
-                    async with aiohttp.ClientSession(
-                        timeout=ClientTimeout(total=5)
-                    ) as loc_session:
-                        async with loc_session.get(
-                            f"http://ip-api.com/json/{ip}?lang=zh-CN"
-                        ) as loc_resp:
-                            if loc_resp.status == 200:
-                                loc_data = await loc_resp.json()
-                                parts = [
-                                    loc_data.get("country", ""),
-                                    loc_data.get("regionName", ""),
-                                    loc_data.get("city", ""),
-                                ]
-                                info["location"] = " ".join(p for p in parts if p)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            return
+        result = self._format_basic_info(profile, 1)
+        result += self._format_site_info(profile)
+        yield event.plain_result(result)
 
-        # WHOIS 查询 → whois.blid.top（小主人自建API）
-        if self.whois_api_key:
-            try:
-                async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as sess:
-                    async with sess.get(
-                        f"https://whois.blid.top/{domain}",
-                        headers={
-                            "Authorization": f"Bearer {self.whois_api_key}",
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        },
-                    ) as resp:
-                        if resp.status == 200:
-                            d = await resp.json()
-                            if d.get("isRegistered"):
-                                info["registrar"] = d.get("registrar", {}).get("name")
-                                dates = d.get("dates", {})
-                                for src_key, dst_key in [("created", "creation_date"), ("expires", "expiration_date"), ("updated", "updated_date")]:
-                                    val = dates.get(src_key)
-                                    if val:
-                                        info[dst_key] = str(val)[:10]
-                                exp = dates.get("expires")
-                                if exp:
-                                    try:
-                                        ed = datetime.strptime(str(exp)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                                        info["domain_days_left"] = max(0, (ed - datetime.now(timezone.utc)).days)
-                                    except Exception:
-                                        pass
-            except Exception:
-                pass
-
-        for scheme in ("https", "http"):
-            url = f"{scheme}://{domain}"
-            try:
-                async with aiohttp.ClientSession(
-                    timeout=ClientTimeout(total=10)
-                ) as session:
-                    import time as time_mod
-                    t0 = time_mod.time()
-                    async with session.get(
-                        url, allow_redirects=True, ssl=False
-                    ) as resp:
-                        info["latency"] = f"{int((time_mod.time() - t0) * 1000)}ms"
-                        info["status"] = resp.status
-                        info["server"] = resp.headers.get("Server", "") or ""
-                        html = await resp.text()
-                        match = re.search(
-                            r"<title[^>]*>(.*?)</title>",
-                            html,
-                            re.IGNORECASE | re.DOTALL,
-                        )
-                        if match:
-                            title = match.group(1).strip()
-                            title = re.sub(r"\s+", " ", title)
-                            for sep in (" - ", " – ", " — ", " | ", " :: ", " » "):
-                                if sep in title:
-                                    title = title.split(sep)[0].strip()
-                                    break
-                            info["title"] = title[:50]
-                        break
-            except Exception:
-                continue
-
-        # SSL 证书查询：内置直查 → 免费 API 兜底
-        ssl_info = await self._fetch_ssl_cert_info(domain)
-        if ssl_info.get("ssl_days_left") is not None:
-            info["ssl_days_left"] = ssl_info["ssl_days_left"]
-            info["ssl_expiry"] = ssl_info["ssl_expiry"]
-        return info
-
-    async def _fetch_ssl_cert_info(self, domain: str) -> dict:
-        domain = self._normalize_domain(domain)
-        result = {"ssl_days_left": None, "ssl_expiry": None, "issuer": None, "subject": None, "san": [], "not_before": None}
-
-        if self.ssl_api_key:
-            try:
-                async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as sess:
-                    async with sess.get(
-                        f"https://ssl.blid.top/ssl/{domain}",
-                        headers={
-                            "X-API-Key": self.ssl_api_key,
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        },
-                    ) as resp:
-                        if resp.status == 200:
-                            d = await resp.json()
-                            cc = d.get("current_certificate", {})
-                            dr = cc.get("days_remaining")
-                            if dr is not None:
-                                result["ssl_days_left"] = int(dr)
-                                result["ssl_expiry"] = str(cc.get("not_after", ""))[:10]
-                            else:
-                                na = cc.get("not_after", "") or ""
-                                if na:
-                                    try:
-                                        exp = datetime.strptime(str(na)[:19], "%Y-%m-%dT%H:%M:%S")
-                                        result["ssl_days_left"] = max(0, (exp.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days)
-                                        result["ssl_expiry"] = exp.strftime("%Y-%m-%d")
-                                    except Exception:
-                                        pass
-                            issuer = cc.get("issuer", {})
-                            result["issuer"] = issuer.get("common_name", "") or issuer.get("organization", "")
-                            result["subject"] = cc.get("subject", {}).get("common_name", "")
-                            result["san"] = cc.get("san", []) or []
-                            nb = cc.get("not_before", "")
-                            if nb:
-                                result["not_before"] = str(nb)[:10]
-            except Exception:
-                pass
-
-        if result["ssl_days_left"] is None:
-            try:
-                import ssl as _ssl
-                from cryptography import x509
-                from cryptography.hazmat.backends import default_backend
-                loop = asyncio.get_event_loop()
-                cert_pem = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None, lambda: _ssl.get_server_certificate((domain, 443))
-                    ),
-                    timeout=10,
-                )
-                cert = x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
-                nb = cert.not_valid_before
-                if nb:
-                    result["not_before"] = nb.strftime("%Y-%m-%d") if nb.tzinfo else nb.replace(tzinfo=timezone.utc).strftime("%Y-%m-%d")
-                na = cert.not_valid_after
-                if na:
-                    if na.tzinfo is None:
-                        na = na.replace(tzinfo=timezone.utc)
-                    result["ssl_days_left"] = max(0, (na - datetime.now(timezone.utc)).days)
-                    result["ssl_expiry"] = na.strftime("%Y-%m-%d")
-                try:
-                    result["issuer"] = cert.issuer.rfc4514_string()
-                except Exception:
-                    pass
-                try:
-                    alt = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-                    result["san"] = alt.value.get_values_for_type(x509.DNSName)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        return result
-
-    # 命令：/绑定网站
+    # ------------------------------------------------------------------ #
+    # 命令：绑定网站
+    # ------------------------------------------------------------------ #
 
     @filter.command("绑定网站")
     async def bind_site(self, event: AstrMessageEvent):
+        """绑定网站：/绑定网站 域名 或 /绑定网站 名称 类型 域名。"""
         group_id = await self._resolve_group_id(event)
         if not group_id:
             yield event.plain_result("❌ 未找到您的档案，请先在群内使用 `/绑定账号` 创建档案。")
@@ -515,48 +1042,37 @@ class QQProfilePlugin(Star):
 
         sender_id = event.get_sender_id()
         sender_name = event.get_sender_name() or "未知用户"
-
-        parts = event.get_message_str().strip().split()
-        args = parts[1:]
+        args = self._message_text(event).split()[1:]
         argc = len(args)
 
         if argc == 1:
-            domain = args[0]
-            if not re.match(DOMAIN_REGEX, domain):
-                yield event.plain_result("❌ 域名格式不正确，请重新输入（如 example.com）。")
-                return
-
-            yield event.plain_result("🔍 正在获取网站信息，请稍候...")
-
-            name = await self._fetch_website_title(domain)
-            if not name:
+            domain = normalize_domain(args[0])
+            if not domain:
                 yield event.plain_result(
-                    "❌ 无法自动获取网站名称，请手动指定：\n"
-                    "/绑定网站 网站名称 网站类型 域名\n\n"
-                    "示例：/绑定网站 我的站点 博客 example.com"
+                    "❌ 域名格式不正确（不支持 IP 地址、内网域名），请重新输入，如 example.com。"
                 )
                 return
-
-            stype = "博客"
-
+            name = None  # 智能模式，稍后再抓标题
+            site_type = "博客"
         elif argc == 3:
-            name, stype, domain = args[0], args[1], args[2]
-
+            name, site_type, raw_domain = args[0], args[1], args[2]
+            domain = normalize_domain(raw_domain)
             if not name or len(name) > 30:
                 yield event.plain_result("❌ 网站名称不能为空且长度不能超过30个字符。")
                 return
-            if stype not in SITE_TYPES:
+            if site_type not in SITE_TYPES:
                 yield event.plain_result(f"❌ 网站类型只支持：{'、'.join(SITE_TYPES)}")
                 return
-            if not re.match(DOMAIN_REGEX, domain):
-                yield event.plain_result("❌ 域名格式不正确，请重新输入（如 example.com）。")
+            if not domain:
+                yield event.plain_result(
+                    "❌ 域名格式不正确（不支持 IP 地址、内网域名），如 example.com。"
+                )
                 return
-
         else:
             yield event.plain_result(
                 "❌ 格式错误。支持两种用法：\n\n"
                 "① 智能识别：/绑定网站 域名\n"
-                "   自动获取网站名称，类型默认为「其他」\n"
+                "   自动获取网站标题作为名称，类型默认为「博客」\n"
                 "   示例：/绑定网站 blog.umrc.cn\n\n"
                 "② 手动指定：/绑定网站 名称 类型 域名\n"
                 f"   网站类型可选：{'、'.join(SITE_TYPES)}\n"
@@ -572,22 +1088,35 @@ class QQProfilePlugin(Star):
             yield event.plain_result("⚠️ 您已绑定站点，如需修改请使用 `/更新网站`。")
             return
 
-        now = self._now_utc()
-
         owner = await self._check_domain_owner(domain, sender_id)
         if owner:
-            yield event.plain_result(f"❌ 域名 {domain} 已被用户 [{owner['username']}] 绑定，请先解绑。")
+            yield event.plain_result(
+                f"❌ 域名 {domain} 已被用户 [{owner.get('username', '未知')}] 绑定，请先解绑。"
+            )
             return
 
-        profile["site"] = {"name": name, "type": stype, "domain": domain}
-        profile["updatedAt"] = now
+        # 本地校验都通过后才发起网络请求，避免白跑一次探测
+        if not name:
+            yield event.plain_result("🔍 正在获取网站信息，请稍候...")
+            info = await self._fetch_domain_info(domain)
+            name = info.get("title")
+            if not name:
+                yield event.plain_result(
+                    "❌ 无法自动获取网站名称，请手动指定：\n"
+                    "/绑定网站 网站名称 网站类型 域名\n\n"
+                    "示例：/绑定网站 我的站点 博客 example.com"
+                )
+                return
+
+        profile["site"] = {"name": name, "type": site_type, "domain": domain}
+        profile["updatedAt"] = self._now_utc()
         profile["username"] = sender_name
         if event.get_group_id():
             profile["groupRole"] = await self._get_group_role(event)
             profile["groupId"] = event.get_group_id()
 
         await self._save_profile(sender_id, profile)
-        await self.put_kv_data(f"_domain_{self._normalize_domain(domain)}", sender_id)
+        await self.put_kv_data(f"_domain_{domain}", sender_id)
         await self._record_last_group(sender_id, group_id)
 
         result = "✅ 站点绑定成功，域名已锁定！\n\n"
@@ -595,10 +1124,13 @@ class QQProfilePlugin(Star):
         result += self._format_site_info(profile)
         yield event.plain_result(result)
 
-    # 命令：/更新网站
+    # ------------------------------------------------------------------ #
+    # 命令：更新网站
+    # ------------------------------------------------------------------ #
 
     @filter.command("更新网站")
     async def update_site(self, event: AstrMessageEvent):
+        """更新已绑定网站的名称、类型或域名。"""
         group_id = await self._resolve_group_id(event)
         if not group_id:
             yield event.plain_result("❌ 未找到您的档案，请先在群内使用 `/绑定账号` 创建档案。")
@@ -608,7 +1140,6 @@ class QQProfilePlugin(Star):
 
         sender_id = event.get_sender_id()
         profile = await self._get_profile(sender_id)
-
         if not profile:
             yield event.plain_result("❌ 您尚未绑定账号，请先使用 `/绑定账号` 创建档案。")
             return
@@ -616,49 +1147,51 @@ class QQProfilePlugin(Star):
             yield event.plain_result("❌ 您尚未绑定网站，请先使用 `/绑定网站`。")
             return
 
-        parts = event.get_message_str().strip().split(maxsplit=3)
+        parts = self._message_text(event).split(maxsplit=3)
         if len(parts) < 4:
             yield event.plain_result(
-                "❌ 格式错误。请使用：\n"
-                "/更新网站 网站名称 网站类型 网站域名"
+                "❌ 格式错误。请使用：\n/更新网站 网站名称 网站类型 网站域名"
             )
             return
 
-        name, stype, domain = parts[1], parts[2], parts[3]
-
+        name, site_type, raw_domain = parts[1], parts[2], parts[3]
+        domain = normalize_domain(raw_domain)
         if not name or len(name) > 30:
             yield event.plain_result("❌ 网站名称不能为空且长度不能超过30个字符。")
             return
-        if stype not in SITE_TYPES:
+        if site_type not in SITE_TYPES:
             yield event.plain_result(f"❌ 网站类型只支持：{'、'.join(SITE_TYPES)}")
             return
-        if not re.match(DOMAIN_REGEX, domain):
-            yield event.plain_result(
-                "❌ 域名格式不正确，请重新输入（如 example.com）。"
-            )
+        if not domain:
+            yield event.plain_result("❌ 域名格式不正确（不支持 IP 地址、内网域名）。")
             return
 
-        old_domain = profile.get("site", {}).get("domain", "")
+        old_domain = (profile.get("site") or {}).get("domain", "")
         if domain != old_domain:
             owner = await self._check_domain_owner(domain, sender_id)
             if owner:
-                yield event.plain_result(f"❌ 域名 {domain} 已被用户 [{owner['username']}] 绑定，请先解绑。")
+                yield event.plain_result(
+                    f"❌ 域名 {domain} 已被用户 [{owner.get('username', '未知')}] 绑定，请先解绑。"
+                )
                 return
 
-        profile["site"] = {"name": name, "type": stype, "domain": domain}
+        profile["site"] = {"name": name, "type": site_type, "domain": domain}
         profile["updatedAt"] = self._now_utc()
         await self._save_profile(sender_id, profile)
-        await self._record_last_group(sender_id, group_id)
-        await self.put_kv_data(f"_domain_{self._normalize_domain(domain)}", sender_id)
+        await self.put_kv_data(f"_domain_{domain}", sender_id)
         if old_domain and old_domain != domain:
-            await self.delete_kv_data(f"_domain_{self._normalize_domain(old_domain)}")
+            await self._release_domain(old_domain, sender_id)
+        await self._record_last_group(sender_id, group_id)
 
         yield event.plain_result("✅ 站点信息已更新！")
 
-    # 命令：/解绑网站
+    # ------------------------------------------------------------------ #
+    # 命令：解绑网站
+    # ------------------------------------------------------------------ #
 
     @filter.command("解绑网站")
     async def unbind_site(self, event: AstrMessageEvent):
+        """解绑网站，基础档案保留。"""
         group_id = await self._resolve_group_id(event)
         if not group_id:
             yield event.plain_result("❌ 未找到您的档案，请先在群内使用 `/绑定账号` 创建档案。")
@@ -668,7 +1201,6 @@ class QQProfilePlugin(Star):
 
         sender_id = event.get_sender_id()
         profile = await self._get_profile(sender_id)
-
         if not profile:
             yield event.plain_result("❌ 您尚未绑定账号，请先使用 `/绑定账号` 创建档案。")
             return
@@ -676,204 +1208,270 @@ class QQProfilePlugin(Star):
             yield event.plain_result("❌ 您尚未绑定网站。")
             return
 
-        old_domain = profile.get("site", {}).get("domain", "")
+        old_domain = (profile.get("site") or {}).get("domain", "")
         profile["site"] = None
         profile["updatedAt"] = self._now_utc()
         await self._save_profile(sender_id, profile)
-        if old_domain:
-            await self.delete_kv_data(f"_domain_{self._normalize_domain(old_domain)}")
+        await self._release_domain(old_domain, sender_id)
         await self._record_last_group(sender_id, group_id)
 
         yield event.plain_result("✅ 已解绑网站，基础档案仍保留。")
 
-    # 命令：/查询域名
+    # ------------------------------------------------------------------ #
+    # 命令：查询域名
+    # ------------------------------------------------------------------ #
+
+    async def _resolve_target_domain(self, event: AstrMessageEvent) -> tuple[str | None, dict | None, bool]:
+        """解析命令参数里的域名；没有参数就取用户已绑定域名。
+
+        返回 (域名, 档案, 是否直接指定)。
+        """
+        parts = re.split(r"\s+", self._message_text(event))
+        if len(parts) > 1:
+            domain = normalize_domain(parts[1])
+            if domain:
+                return domain, None, True
+        profile = await self._get_profile(event.get_sender_id())
+        if profile and (profile.get("site") or {}).get("domain"):
+            return profile["site"]["domain"], profile, False
+        return None, profile, False
 
     @filter.command("查询域名")
     async def query_domain(self, event: AstrMessageEvent):
-        msg = event.get_message_str()
-        parts = re.split(r"\s+", msg.strip())
-        direct = False
-        if len(parts) > 1 and re.match(DOMAIN_REGEX, parts[1]):
-            domain = self._normalize_domain(parts[1])
-            direct = True
-        else:
-            sender_id = event.get_sender_id()
-            group_id = event.get_group_id()
-            site = None
-            if group_id:
-                await self._record_last_group(sender_id, group_id)
-                profile = await self._get_profile(sender_id)
-            else:
-                gid = await self._get_last_group(sender_id)
-                if gid:
-                    profile = await self._get_profile(sender_id)
-                else:
-                    profile = None
-            if profile and profile.get("site"):
-                site = profile["site"]
-            if not site:
-                yield event.plain_result("❌ 您尚未绑定网站，也无法识别域名参数。\n用法：/查询域名 或 /查询域名 域名")
-                return
-            domain = site["domain"]
+        """查询域名实时信息（WHOIS / 存活 / 延迟 / 归属地）。"""
+        sender_id = event.get_sender_id()
+        if event.get_group_id():
+            await self._record_last_group(sender_id, event.get_group_id())
 
-        yield event.plain_result(f"🔍 正在查询域名 {domain} 的信息，请稍候...")
+        domain, profile, direct = await self._resolve_target_domain(event)
+        if not domain:
+            yield event.plain_result(
+                "❌ 您尚未绑定网站，也无法识别域名参数。\n用法：/查询域名 或 /查询域名 域名"
+            )
+            return
 
+        yield event.plain_result(f"🔍 正在查询 {domain} 的信息，请稍候...")
         info = await self._fetch_domain_info(domain)
 
-        if direct:
-            result = f"📋 域名信息\n域名 '{domain}'\n"
-        else:
-            result = (
-                "📋 域名信息\n"
-                f"网站名称 '{site['name']}'\n"
-                f"网站类型 '{site['type']}'\n"
-                f"域名 '{domain}'\n"
+        if info.get("error") == "dns":
+            yield event.plain_result(
+                f"❌ 域名 {domain} 解析失败或指向内网地址，无法查询。"
             )
-        if info.get("title"):
-            result += f"网站标题 '{info['title']}'\n"
-        if info.get("status"):
-            result += f"响应状态 '{info['status']}'\n"
-        if info.get("latency"):
-            result += f"响应延迟 '{info['latency']}'\n"
-        if info.get("server"):
-            result += f"服务器 '{info['server']}'\n"
-        if info.get("location"):
-            result += f"服务器地区 '{info['location']}'\n"
-        if info.get("registrar"):
-            result += f"注册商 '{info['registrar']}'\n"
-        if info.get("creation_date") and info["creation_date"] != "未知":
-            result += f"注册时间 '{info['creation_date']}'\n"
-        if info.get("expiration_date") and info["expiration_date"] != "未知":
-            result += f"过期时间 '{info['expiration_date']}'\n"
-        if info.get("updated_date") and info["updated_date"] != "未知":
-            result += f"最近更新 '{info['updated_date']}'"
+            return
 
-        yield event.plain_result(result)
+        if direct:
+            lines = ["📋 域名信息", f"域名 '{domain}'"]
+        else:
+            site = (profile or {}).get("site") or {}
+            icp = site.get("icp_licence")
+            lines = [
+                "📋 域名信息",
+                f"网站名称 '{site.get('name', '')}'",
+                f"网站类型 '{site.get('type', '')}'",
+                f"域名 '{domain}'",
+            ]
+            if icp:
+                lines.append(f"备案信息 '{icp}'")
+
+        if info.get("title"):
+            lines.append(f"网站标题 '{info['title']}'")
+        if info.get("status") is not None:
+            lines.append(f"响应状态 '{info['status']}'")
+        if info.get("latency_ms") is not None:
+            lines.append(f"响应延迟 '{info['latency_ms']}ms'")
+        if info.get("https_ok"):
+            lines.append("HTTPS '可用（证书有效）'")
+        if info.get("server"):
+            lines.append(f"服务器 '{info['server']}'")
+        if info.get("ip"):
+            lines.append(f"IP '{info['ip']}'")
+        if info.get("location"):
+            lines.append(f"服务器地区 '{info['location']}'")
+        if info.get("registrar"):
+            lines.append(f"注册商 '{info['registrar']}'")
+        if info.get("creation_date"):
+            lines.append(f"注册时间 '{info['creation_date']}'")
+        if info.get("expiration_date"):
+            lines.append(f"过期时间 '{info['expiration_date']}'")
+        if info.get("domain_days_left") is not None:
+            lines.append(f"域名有效期 '{format_days(info['domain_days_left'])}'")
+        if info.get("updated_date"):
+            lines.append(f"最近更新 '{info['updated_date']}'")
+        ssl_info = info.get("ssl") or {}
+        if ssl_info.get("days_left") is not None:
+            lines.append(f"证书剩余 '{format_days(ssl_info['days_left'])}'")
+
+        if not info.get("reachable"):
+            lines.append("⚠️ 站点当前无法访问，以上部分信息可能缺失")
+
+        yield event.plain_result("\n".join(lines))
+
+    # ------------------------------------------------------------------ #
+    # 命令：查询备案
+    # ------------------------------------------------------------------ #
 
     @filter.command("查询备案")
     async def query_icp(self, event: AstrMessageEvent):
-        msg = event.get_message_str()
-        parts = re.split(r"\s+", msg.strip())
-        is_bound = False
-        if len(parts) > 1 and re.match(DOMAIN_REGEX, parts[1]):
-            domain = self._normalize_domain(parts[1])
-        else:
-            sender_id = event.get_sender_id()
-            profile = await self._get_profile(sender_id)
-            if not profile or not profile.get("site"):
-                yield event.plain_result("❌ 您尚未绑定网站，也无法识别域名参数。\n用法：/查询备案 或 /查询备案 域名")
-                return
-            domain = profile["site"]["domain"]
-            is_bound = True
+        """查询 ICP 备案信息。"""
+        domain, profile, direct = await self._resolve_target_domain(event)
+        if not domain:
+            yield event.plain_result(
+                "❌ 您尚未绑定网站，也无法识别域名参数。\n用法：/查询备案 或 /查询备案 域名"
+            )
+            return
         if not self.icp_api_key:
             yield event.plain_result("❌ 未配置 ICP 密钥，请在插件配置中填写 ICP密钥。")
             return
+
         yield event.plain_result(f"🔍 正在查询 {domain} 的 ICP 备案信息，请稍候...")
-        import aiohttp
-        from aiohttp import ClientTimeout
         try:
-            async with aiohttp.ClientSession(timeout=ClientTimeout(total=10)) as sess:
-                async with sess.get(
+            async with aiohttp.ClientSession(
+                timeout=ClientTimeout(total=10), headers={"User-Agent": UA}
+            ) as session:
+                async with session.get(
                     "https://icp.blid.top/query/web",
                     params={"search": domain},
-                    headers={
-                        "Authorization": f"Bearer {self.icp_api_key}",
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    },
+                    headers={"Authorization": f"Bearer {self.icp_api_key}"},
                 ) as resp:
                     if resp.status != 200:
                         yield event.plain_result(f"❌ ICP 查询失败，HTTP {resp.status}。")
                         return
-                    raw = await resp.json()
-                    params = raw.get("params", {})
-                    items = params.get("list", [])
-                    total = params.get("total", 0)
-                    if not items:
-                        yield event.plain_result(f"📋 未找到 {domain} 的 ICP 备案信息。")
-                        return
-                    lines = ["📋 ICP 备案信息", ""]
-                    for idx, item in enumerate(items[:5]):
-                        if idx > 0:
-                            lines.append("")
-                        nature = item.get('natureName', '')
-                        unit_label = "备案主体" if nature == "个人" else "主办单位"
-                        lines.append(f"域名: {item.get('domain', 'N/A')}")
-                        lines.append(f"{unit_label}: {item.get('unitName', 'N/A')}")
-                        lines.append(f"备案号: {item.get('serviceLicence', 'N/A')}")
-                        lines.append(f"备案性质: {nature}")
-                        lines.append(f"通过时间: {item.get('updateRecordTime', 'N/A')}")
-                    if total > 5:
-                        lines.append(f"\n... 共 {total} 条，仅展示前 5 条。")
-                    if is_bound and items:
-                        icp_no = items[0].get("serviceLicence", "")
-                        if icp_no and profile.get("site", {}).get("icp_licence") != icp_no:
-                            profile.setdefault("site", {})["icp_licence"] = icp_no
-                            await self._save_profile(sender_id, profile)
-                    yield event.plain_result("\n".join(lines))
-        except Exception as e:
-            yield event.plain_result(f"❌ ICP 查询失败: {type(e).__name__}")
+                    raw = await resp.json(content_type=None)
+        except Exception as exc:
+            logger.warning(f"[qq_profile] ICP 查询异常 {domain}: {exc!r}")
+            yield event.plain_result(f"❌ ICP 查询失败: {type(exc).__name__}")
+            return
+
+        # 实测：文档写返回裸数组，但线上实际返回 {code, msg, params:{list,total}, success}
+        # 两种形状都兼容，避免接口哪天改回去就整条链路失效
+        if isinstance(raw, list):
+            items = raw
+        elif isinstance(raw, dict):
+            if raw.get("success") is False:
+                yield event.plain_result(
+                    f"❌ ICP 查询失败：{raw.get('msg') or '接口返回 success=false'}"
+                )
+                return
+            params = raw.get("params") or {}
+            items = params.get("list") or []
+        else:
+            yield event.plain_result("❌ ICP 接口返回了无法识别的内容。")
+            return
+
+        # 实测发现 search 参数目前不可靠（换个关键词会返回同一条无关记录），
+        # 所以必须自己校验返回的域名与查询域名是否真的相关，否则会张冠李戴。
+        def related(item_domain: str) -> bool:
+            item_domain = (item_domain or "").strip().lower().rstrip(".")
+            if not item_domain:
+                return False
+            if item_domain == domain:
+                return True
+            return item_domain.endswith("." + domain) or domain.endswith("." + item_domain)
+
+        matched = [item for item in items if related(item.get("domain", ""))]
+        dropped = len(items) - len(matched)
+        if dropped:
+            logger.warning(
+                f"[qq_profile] ICP 返回了 {dropped} 条与 {domain} 无关的记录，已过滤"
+            )
+        if not matched:
+            message = f"📋 未找到 {domain} 的 ICP 备案信息。"
+            if dropped:
+                message += f"\n（接口返回了 {dropped} 条与当前域名无关的记录，已忽略）"
+            yield event.plain_result(message)
+            return
+
+        lines = ["📋 ICP 备案信息", ""]
+        for index, item in enumerate(matched[:5]):
+            if index > 0:
+                lines.append("")
+            nature = item.get("natureName", "")
+            unit_label = "备案主体" if nature == "个人" else "主办单位"
+            lines.append(f"域名: {item.get('domain', 'N/A')}")
+            lines.append(f"{unit_label}: {item.get('unitName', 'N/A')}")
+            lines.append(f"备案号: {item.get('serviceLicence', 'N/A')}")
+            lines.append(f"备案性质: {nature}")
+            lines.append(f"通过时间: {item.get('updateRecordTime', 'N/A')}")
+        if len(matched) > 5:
+            lines.append(f"\n... 共 {len(matched)} 条，仅展示前 5 条。")
+        if dropped:
+            lines.append(f"\n（接口返回 {len(items)} 条，其中 {dropped} 条与当前域名无关已过滤）")
+
+        # 顺手把备案号写回档案，方便 /查询域名 展示
+        if not direct and profile:
+            icp_no = matched[0].get("serviceLicence", "")
+            site = profile.get("site") or {}
+            if icp_no and site.get("icp_licence") != icp_no:
+                site["icp_licence"] = icp_no
+                profile["site"] = site
+                await self._save_profile(event.get_sender_id(), profile)
+
+        yield event.plain_result("\n".join(lines))
+
+    # ------------------------------------------------------------------ #
+    # 命令：查询证书
+    # ------------------------------------------------------------------ #
 
     @filter.command("查询证书")
     async def query_ssl(self, event: AstrMessageEvent):
-        msg = event.get_message_str()
-        parts = re.split(r"\s+", msg.strip())
-        if len(parts) > 1 and re.match(DOMAIN_REGEX, parts[1]):
-            domain = self._normalize_domain(parts[1])
-        else:
-            sender_id = event.get_sender_id()
-            profile = await self._get_profile(sender_id)
-            if not profile or not profile.get("site"):
-                yield event.plain_result("❌ 您尚未绑定网站，也无法识别域名参数。\n用法：/查询证书 或 /查询证书 域名")
-                return
-            domain = profile["site"]["domain"]
-        if not self.ssl_api_key:
-            yield event.plain_result("❌ 未配置 SSL 密钥，请在插件配置中填写 SSL密钥。")
+        """查询 SSL 证书；没有 API 密钥时走免密钥直连。"""
+        domain, _profile, _direct = await self._resolve_target_domain(event)
+        if not domain:
+            yield event.plain_result(
+                "❌ 您尚未绑定网站，也无法识别域名参数。\n用法：/查询证书 或 /查询证书 域名"
+            )
             return
-        yield event.plain_result(f"🔍 正在查询 {domain} 的 SSL 证书，请稍候...")
-        try:
-            info = await self._fetch_ssl_cert_info(domain)
-            if info.get("ssl_days_left") is None:
-                yield event.plain_result(f"📋 未能获取 {domain} 的 SSL 证书信息。")
-                return
-            lines = ["📋 SSL 证书信息", ""]
-            lines.append(f"域名: {domain}")
-            if info.get("subject"):
-                lines.append(f"主题: {info['subject']}")
-            if info.get("issuer"):
-                lines.append(f"颁发者: {info['issuer']}")
-            if info.get("not_before"):
-                lines.append(f"生效时间: {info['not_before']}")
-            if info.get("ssl_expiry"):
-                lines.append(f"到期时间: {info['ssl_expiry']}")
-            if info.get("ssl_days_left") is not None:
-                lines.append(f"剩余天数: {info['ssl_days_left']} 天")
-            san = info.get("san", [])
-            if san:
-                lines.append(f"覆盖域名: {', '.join(san[:5])}")
-                if len(san) > 5:
-                    lines.append(f"  ... 共 {len(san)} 个域名")
-            yield event.plain_result("\n".join(lines))
-        except Exception as e:
-            yield event.plain_result(f"❌ SSL 查询失败: {type(e).__name__}")
 
-    # 命令：/删除档案（群主/管理员专用）
+        yield event.plain_result(f"🔍 正在查询 {domain} 的 SSL 证书，请稍候...")
+        info = await self._fetch_ssl_info(domain)
+
+        if info.get("days_left") is None and info.get("expiry") is None:
+            if info.get("state") == "refused":
+                yield event.plain_result(f"📋 {domain} 未启用 HTTPS（443 端口拒绝连接）。")
+            else:
+                yield event.plain_result(
+                    f"❌ 未能读取 {domain} 的证书。\n"
+                    "可在插件配置里填写 SSL密钥 走 API 查询。"
+                )
+            return
+
+        lines = ["📋 SSL 证书信息", "", f"域名: {domain}"]
+        if info.get("issuer"):
+            lines.append(f"颁发者: {info['issuer']}")
+        if info.get("not_before"):
+            lines.append(f"生效时间: {info['not_before']}")
+        if info.get("expiry"):
+            lines.append(f"到期时间: {info['expiry']}")
+        if info.get("days_left") is not None:
+            lines.append(f"剩余天数: {info['days_left']} 天")
+        san = info.get("san") or []
+        if san:
+            lines.append(f"覆盖域名: {', '.join(san[:5])}")
+            if len(san) > 5:
+                lines.append(f"  ... 共 {len(san)} 个域名")
+        if info.get("source"):
+            lines.append(f"数据来源: {info['source']}")
+        if info.get("days_left") is not None and info["days_left"] <= 30:
+            lines.append("⚠️ 证书即将到期，请及时续签")
+
+        yield event.plain_result("\n".join(lines))
+
+    # ------------------------------------------------------------------ #
+    # 命令：删除档案
+    # ------------------------------------------------------------------ #
 
     @filter.command("删除档案")
     async def delete_profile(self, event: AstrMessageEvent):
-        group_id = await self._resolve_group_id(event)
-        if not group_id:
-            yield event.plain_result("❌ 未找到可操作的群，请先在群内使用此命令。")
-            return
-        if event.get_group_id():
-            await self._record_last_group(event.get_sender_id(), group_id)
-
+        """删除用户档案（仅白名单管理员）。"""
         if not await self._is_admin(event):
-            yield event.plain_result("⛔ 只有群主或管理员可以执行此操作。")
+            yield event.plain_result(
+                "⛔ 只有白名单管理员可以执行此操作（在插件配置 admin_ids 中填写 QQ 号）。"
+            )
             return
 
         target_qq = self._get_at_qq(event)
         if not target_qq and not event.get_group_id():
-            parts = event.get_message_str().strip().split(maxsplit=1)
+            parts = self._message_text(event).split(maxsplit=1)
             if len(parts) >= 2 and parts[1].strip().isdigit():
                 target_qq = parts[1].strip()
         if not target_qq:
@@ -889,268 +1487,115 @@ class QQProfilePlugin(Star):
             yield event.plain_result("❌ 该用户暂无档案。")
             return
 
-        username = profile["username"]
+        username = profile.get("username", "未知")
+        old_domain = (profile.get("site") or {}).get("domain", "")
+
         await self._delete_profile(target_qq)
+        await self._release_domain(old_domain, target_qq)
+        await self.delete_kv_data(f"_user_group_{target_qq}")
 
         yield event.plain_result(f"✅ 已删除用户 [{username}] 的档案。")
 
-    @staticmethod
-    def _fmt_days(days: int) -> str:
-        if days is None:
-            return "未知"
-        if days >= 365:
-            y = days // 365
-            if y >= 10:
-                return f"{y}年"
-            return f"{y}年"
-        if days >= 30:
-            m = days // 30
-            return f"{m}个月"
-        return f"{days}天"
-
-    async def _get_rankings(self):
-        raw = await self.get_kv_data("_rankings", None)
-        if raw and isinstance(raw, str):
-            import json as _json
-            try:
-                return _json.loads(raw)
-            except Exception:
-                return []
-        if isinstance(raw, list):
-            return raw
-        return []
-
-    async def _save_ranking(self, domain, name, score):
-        import json as _json
-        rankings = await self._get_rankings()
-        now = datetime.now(timezone.utc).isoformat()
-        updated = False
-        for r in rankings:
-            if r["domain"] == domain:
-                r["score"] = score
-                r["time"] = now
-                updated = True
-                break
-        if not updated:
-            rankings.append({"domain": domain, "name": name, "score": score, "time": now})
-        perfect = [r for r in rankings if r["score"] >= 5.0]
-        perfect.sort(key=lambda x: x["time"])
-        others = [r for r in rankings if r["score"] < 5.0]
-        others.sort(key=lambda x: (-x["score"], x["time"]))
-        rankings = perfect[-5:] + others
-        await self.put_kv_data("_rankings", _json.dumps(rankings, ensure_ascii=False))
-
-    @filter.command("排行")
-    async def ranking(self, event: AstrMessageEvent):
-        rankings = await self._get_rankings()
-        if not rankings:
-            yield event.plain_result("📊 暂无排行榜数据，快去用 /评价 打分吧！")
-            return
-        perfect = [r for r in rankings if r["score"] >= 5.0]
-        perfect.sort(key=lambda x: x["time"])
-        others = [r for r in rankings if r["score"] < 5.0]
-        others.sort(key=lambda x: (-x["score"], x["time"]))
-        merged = perfect[-5:] + others
-        lines = ["🏆 网站排行榜 TOP12"]
-        for i, r in enumerate(merged[:12]):
-            medal = ["🥇", "🥈", "🥉"][i] if i < 3 else f"{i+1}."
-            sc = float(r["score"])
-            lines.append(f"{medal} {sc}/5.0  {r['domain']}")
-        yield event.plain_result("\n".join(lines))
+    # ------------------------------------------------------------------ #
+    # 命令：评价
+    # ------------------------------------------------------------------ #
 
     @filter.command("评价")
     async def rate_site(self, event: AstrMessageEvent):
-        sender_id = event.get_sender_id()
-        profile = await self._get_profile(sender_id)
-        if not profile or not profile.get("site"):
+        """对已绑定网站做六维加权评分。"""
+        profile = await self._get_profile(event.get_sender_id())
+        site = (profile or {}).get("site")
+        if not site:
             yield event.plain_result("❌ 您尚未绑定网站，无法进行评价。")
             return
 
-        site = profile["site"]
         domain = site["domain"]
         yield event.plain_result(f"🔍 正在分析 {domain} 的各项数据，请稍候...")
 
         try:
             info = await self._fetch_domain_info(domain)
-        except Exception:
-            info = {}
-        score = 0.0
-        details = []
+        except Exception as exc:
+            logger.warning(f"[qq_profile] 评价数据获取失败 {domain}: {exc!r}")
+            yield event.plain_result(f"❌ 获取 {domain} 的数据失败，请稍后再试。")
+            return
 
-        # ① 域名有效期 (0.5分)
-        days = info.get("domain_days_left")
-        if days is not None:
-            ft = self._fmt_days(days)
-            if days >= 365:
-                score += 0.5
-                details.append(f"✅ 域名有效期充裕({ft})")
-            elif days >= 180:
-                score += 0.4
-                details.append(f"✅ 域名有效期较长({ft})")
-            elif days >= 90:
-                score += 0.3
-                details.append(f"⚪ 域名有效期尚可({ft})")
-            elif days >= 30:
-                score += 0.1
-                details.append(f"🔴 域名即将到期({ft})")
-            else:
-                details.append("🔴 域名已到期")
-        else:
-            details.append("⚪ 暂无数据域名有效期")
+        if info.get("error") == "dns":
+            yield event.plain_result(f"❌ 域名 {domain} 解析失败，无法评价。")
+            return
 
-        # ② SSL证书 (0.5分)
-        ssl_days = info.get("ssl_days_left")
-        if ssl_days is not None:
-            if ssl_days >= 30:
-                score += 0.5
-                details.append(f"✅ SSL证书正常({ssl_days}天)")
-            elif ssl_days >= 10:
-                score += 0.3
-                details.append(f"⚪ 建议续期SSL证书({ssl_days}天)")
-            else:
-                score += 0.1
-                details.append(f"🔴 证书即将到期({ssl_days}天)")
-        else:
-            details.append("⚪ 暂无数据SSL证书")
+        if not info.get("reachable"):
+            yield event.plain_result(
+                f"📊 网站评价 · {site.get('name', domain)}\n"
+                "⚫ 0.0/5.0\n\n"
+                "❌ 站点当前无法访问（DNS 解析正常但 HTTP 无响应）。\n"
+                "本次结果不计入排行榜，请稍后重试。"
+            )
+            return
 
-        # ③ 网站响应速度 (0.5分)
-        status = info.get("status")
-        latency = info.get("latency")
-        if status == 200:
-            if latency:
-                try:
-                    ms = int(re.sub(r"\D", "", latency))
-                    if ms < 500:
-                        score += 0.5
-                        details.append(f"✅ 响应速度快({ms}ms)")
-                    elif ms < 2000:
-                        score += 0.3
-                        details.append(f"⚪ 响应速度一般({ms}ms)")
-                    else:
-                        score += 0.1
-                        details.append(f"🔴 响应速度较慢({ms}ms)")
-                except Exception:
-                    score += 0.3
-                    details.append("⚪ 响应状态正常")
-            else:
-                score += 0.3
-                details.append("⚪ 响应状态正常")
-        elif status:
-            score += 0.1
-            details.append(f"🔴 网站返回状态码{status}")
-        else:
-            details.append("🔴 网站无法访问")
+        rows = self._dimension_ratios(info)
+        score, coverage = self._final_score(rows)
+        if coverage == 0:
+            yield event.plain_result("❌ 数据严重不足，暂时无法给出评价。")
+            return
 
-        # ④ 标题质量 (0.5分)
-        title = info.get("title")
-        if title and len(title) >= 4:
-            score += 0.5
-            details.append("✅ 网站标题完整有意义")
-        elif title:
-            score += 0.3
-            details.append("⚪ 网站标题较短")
-        else:
-            details.append("⚪ 暂无数据网站标题")
+        full = int(score)
+        half = 1 if score - full >= 0.3 else 0
+        stars = "⭐" * full + ("✨" if half else "") + "☆" * max(0, 5 - full - half)
 
-        # ⑤ 服务器信息 (0.5分)
-        server = info.get("server")
-        if server:
-            score += 0.5
-            details.append(f"✅ 服务器信息可见({server})")
-        else:
-            details.append("⚪ 暂无数据服务器信息")
+        lines = [
+            f"📊 网站评价 · {site.get('name', domain)}",
+            f"{stars} {score}/5.0    数据覆盖 {int(coverage * 100)}%",
+            "",
+        ]
+        weak: list[str] = []
+        for _key, label, weight, ratio, note in rows:
+            if ratio is None:
+                lines.append(f"➖ {label} {weight}%  {'░' * 5}  无数据 · {note}")
+                continue
+            lines.append(
+                f"{ratio_level(ratio)} {label} {weight}%  "
+                f"{bar(ratio)}  {note}"
+            )
+            if ratio < 0.5:
+                weak.append(label)
 
-        # ⑥ 服务器地区 (0.5分)
-        location = info.get("location")
-        if location:
-            score += 0.5
-            details.append(f"✅ 服务器地区可查({location})")
-        else:
-            details.append("⚪ 暂无数据服务器地区")
+        lines.append("")
+        lines.append(self._grade_text(score))
+        if weak:
+            lines.append("待改进：" + "、".join(weak))
+        if coverage < 0.75:
+            lines.append(
+                f"注：仅取到 {int(coverage * 100)}% 的指标，分数已按覆盖率向 3.0 收敛，"
+                "配置 WHOIS 密钥可获得更准确的评分。"
+            )
 
-        # ⑦ 注册商 (0.5分)
-        registrar = info.get("registrar")
-        if registrar:
-            score += 0.5
-            details.append(f"✅ 注册商信息可见({registrar})")
-        else:
-            details.append("⚪ 暂无数据注册商信息")
+        yield event.plain_result("\n".join(lines))
+        await self._save_ranking(domain, site.get("name", domain), score, coverage)
 
-        # ⑧ 域名年龄 (0.5分)
-        create_date = info.get("creation_date")
-        if create_date and create_date != "未知":
-            m = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(create_date))
-            if m:
-                created = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=timezone.utc)
-                now = datetime.now(timezone.utc)
-                years = now.year - created.year
-                if now.month < created.month or (now.month == created.month and now.day < created.day):
-                    years -= 1
-                age_days = (now - created).days
-                if years >= 1:
-                    score += 0.5
-                    details.append(f"✅ 域名注册已 {years} 年")
-                elif age_days >= 180:
-                    score += 0.3
-                    details.append(f"⚪ 域名注册已 {self._fmt_days(age_days)}")
-                else:
-                    score += 0.1
-                    details.append(f"⚪ 域名注册仅 {age_days} 天")
-            else:
-                details.append("⚪ 域名年龄未知")
-        else:
-            details.append("⚪ 暂无数据域名注册时间")
+    # ------------------------------------------------------------------ #
+    # 命令：排行
+    # ------------------------------------------------------------------ #
 
-        # ⑨ HTTPS与响应状态 (0.5分)
-        if status == 200:
-            score += 0.5
-            details.append("✅ 支持HTTPS且正常响应")
-        elif status:
-            score += 0.2
-            details.append(f"⚪ 网站可访问(状态码{status})")
-        else:
-            details.append("🔴 网站无法访问")
+    @filter.command("排行")
+    async def ranking(self, event: AstrMessageEvent):
+        """查看评价排行榜 TOP12。"""
+        rankings = await self._get_rankings()
+        if not rankings:
+            yield event.plain_result("📊 暂无排行榜数据，快去用 /评价 打分吧！")
+            return
 
-        # 去掉真正拿不到数据的项（不影响评分）
-        valid_count = 9
+        perfect = [r for r in rankings if r.get("score", 0) >= 5.0]
+        perfect.sort(key=lambda r: r.get("time", ""))
+        others = [r for r in rankings if r.get("score", 0) < 5.0]
+        others.sort(key=lambda r: (-r.get("score", 0), r.get("time", "")))
+        merged = (perfect[-5:] + others)[:12]
 
-        if valid_count > 0:
-            max_possible = valid_count * 0.5
-            final_score = round(score / max_possible * 5, 1)
-            final_score = min(final_score, 5.0)
-        else:
-            final_score = 0.0
+        lines = ["🏆 网站排行榜 TOP12"]
+        for index, record in enumerate(merged):
+            medal = ["🥇", "🥈", "🥉"][index] if index < 3 else f"{index + 1}."
+            lines.append(
+                f"{medal} {float(record.get('score', 0)):.1f}/5.0  "
+                f"{record.get('domain', '')}"
+            )
+        yield event.plain_result("\n".join(lines))
 
-        full = int(final_score)
-        half = 1 if final_score - full >= 0.3 else 0
-        stars = "⭐" * full + ("✨" if half else "") + "☆" * (5 - full - half)
-
-        if final_score >= 4.5:
-            comment = "非常优秀的网站！各方面表现出色，维护状态极佳。"
-        elif final_score >= 3.5:
-            comment = "整体表现良好，各方面较为均衡，可继续优化细节。"
-        elif final_score >= 2.5:
-            comment = "中规中矩，部分项目有待加强，建议关注安全和稳定性。"
-        elif final_score >= 1.5:
-            comment = "存在较多问题，建议尽快检查域名和服务器配置。"
-        elif final_score >= 0.5:
-            comment = "网站状态较差，多项指标异常，需要全面排查。"
-        else:
-            comment = "暂无有效数据或网站无法正常访问。"
-
-        pos = [d for d in details if d.startswith("✅")]
-        neg = [d for d in details if d.startswith("🔴")]
-        summary = f"优势{len(pos)}项" + (f" 待改进{len(neg)}项" if neg else "")
-
-        result = (
-            f"📋 网站评价 - {site['name']}\n"
-            f"{stars} {final_score}/5.0  ({summary} 基于{valid_count}/9项数据)\n\n"
-            f"{comment}\n\n"
-            f"详细评分：\n"
-        )
-        result += "\n".join(details)
-        ssl_expiry = info.get("ssl_expiry")
-        if ssl_expiry:
-            result += f"\n\nSSL证书有效期至 {ssl_expiry}"
-        yield event.plain_result(result)
-        await self._save_ranking(domain, site["name"], final_score)

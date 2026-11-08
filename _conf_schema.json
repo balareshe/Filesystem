@@ -1,26 +1,29 @@
 {
     "admin_ids": {
         "type": "list",
-        "default": [],
-        "name": "管理员ID",
-        "description": "管理员账号"
+        "description": "白名单管理员 QQ 号",
+        "hint": "每行一个 QQ 号。只有这里的管理员能 @ 查他人档案、删除档案。群主/群管理不算。",
+        "default": []
     },
     "whois_api_key": {
         "type": "string",
+        "description": "WHOIS API 密钥",
+        "hint": "留空则跳过注册商/注册时间/到期时间，评价里的「域名有效期」「域名年龄」会显示无数据。",
         "default": "",
-        "name": "API密钥",
-        "description": "域名信息查询API密钥"
+        "secret": true
     },
     "ssl_api_key": {
         "type": "string",
+        "description": "SSL API 密钥",
+        "hint": "留空也可用：插件会直连 443 端口读取证书，只有在直连失败时才需要这个密钥兜底。",
         "default": "",
-        "name": "SSL密钥",
-        "description": "SSL信息查询API密钥"
+        "secret": true
     },
     "icp_api_key": {
         "type": "string",
+        "description": "ICP 备案 API 密钥",
+        "hint": "填写后才能使用 /查询备案。留空时该命令会提示未配置。",
         "default": "",
-        "name": "ICP密钥",
-        "description": "ICP备案查询API密钥"
+        "secret": true
     }
 }
