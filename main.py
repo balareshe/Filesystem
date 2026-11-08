@@ -9,7 +9,7 @@
     _next_profile_id      自增编号
     _rankings             JSON 数组，评价榜单
 
-v1.7.1 主要变更（相对 v1.4.1）：
+v1.7.2 主要变更（相对 v1.4.1）：
     * 域名归一化（小写、去 www、拒绝 IP 字面量与内网域名），修复独占锁可被绕过
     * 评价体系重做：6 个维度加权 + 动态分母 + 覆盖率收敛，解决"人人 4.8 分"
     * 评价 v1.6.0：维度重构为 6 项可测信号（新增内容与工程），冷启动 3 次采样取中位，
@@ -470,13 +470,14 @@ class QQProfilePlugin(Star):
         pid = profile.get("id", str(index))
         role = group_role or profile.get("groupRole", "未知")
         gid = group_id or profile.get("groupId", "未知")
+        # 手机端风格：一个字段一行，用全角冒号，不再套代码风的单引号
         return (
-            "# 基础信息\n"
-            f"编号 '{pid}'\n"
-            f"QQ号 '{profile.get('qq', '未知')}'\n"
-            f"用户名 '{profile.get('username', '未知')}'\n"
-            f"群身份 '{role}'\n"
-            f"所在群 '{gid}'"
+            "📇 档案\n"
+            f"编号：{pid}\n"
+            f"QQ：{profile.get('qq', '未知')}\n"
+            f"用户名：{profile.get('username', '未知')}\n"
+            f"群身份：{role}\n"
+            f"所在群：{gid}"
         )
 
     @staticmethod
@@ -485,14 +486,14 @@ class QQProfilePlugin(Star):
         if not site:
             return ""
         result = (
-            "\n\n# 站点信息\n"
-            f"网站名称 '{site.get('name', '')}'\n"
-            f"网站类型 '{site.get('type', '')}'\n"
-            f"网站域名 '{site.get('domain', '')}'"
+            "\n\n🌐 站点\n"
+            f"名称：{site.get('name', '')}\n"
+            f"类型：{site.get('type', '')}\n"
+            f"域名：{site.get('domain', '')}"
         )
         icp = site.get("icp_licence", "")
         if icp:
-            result += f"\n备案信息 '{icp}'"
+            result += f"\n备案：{icp}"
         return result
 
     # ------------------------------------------------------------------ #
@@ -1839,61 +1840,65 @@ class QQProfilePlugin(Star):
             )
             return
 
+        # 手机端风格：标签：值，一个字段一行
+        lines = ["📋 域名信息"]
         if direct:
-            lines = ["📋 域名信息", f"域名 '{domain}'"]
+            lines.append(f"域名：{domain}")
         else:
             site = (profile or {}).get("site") or {}
-            icp = site.get("icp_licence")
-            lines = [
-                "📋 域名信息",
-                f"网站名称 '{site.get('name', '')}'",
-                f"网站类型 '{site.get('type', '')}'",
-                f"域名 '{domain}'",
-            ]
-            if icp:
-                lines.append(f"备案信息 '{icp}'")
+            if site.get("name"):
+                lines.append(f"名称：{site['name']}")
+            if site.get("type"):
+                lines.append(f"类型：{site['type']}")
+            lines.append(f"域名：{domain}")
+            if site.get("icp_licence"):
+                lines.append(f"备案：{site['icp_licence']}")
 
         if info.get("title"):
-            lines.append(f"网站标题 '{info['title']}'")
+            lines.append(f"标题：{info['title']}")
         if info.get("status") is not None:
-            lines.append(f"响应状态 '{info['status']}'")
+            lines.append(f"状态：{info['status']}")
         if info.get("latency_ms") is not None:
-            lines.append(f"响应延迟 '{info['latency_ms']}ms'")
+            lines.append(f"延迟：{info['latency_ms']}ms")
         if info.get("https_ok"):
-            lines.append("HTTPS '可用（证书有效）'")
+            lines.append("HTTPS：可用（证书有效）")
         if info.get("server"):
-            lines.append(f"服务器 '{info['server']}'")
+            lines.append(f"服务器：{info['server']}")
         if info.get("ip"):
-            lines.append(f"IP '{info['ip']}'")
+            lines.append(f"IP：{info['ip']}")
         if info.get("location"):
-            lines.append(f"服务器地区 '{info['location']}'")
+            lines.append(f"地区：{info['location']}")
         if info.get("registrar"):
-            lines.append(f"注册商 '{info['registrar']}'")
+            registrar = str(info["registrar"])
+            if len(registrar) > 14:
+                registrar = registrar[:14] + "…"
+            lines.append(f"注册商：{registrar}")
         if info.get("creation_date"):
-            lines.append(f"注册时间 '{info['creation_date']}'")
+            lines.append(f"注册：{info['creation_date']}")
         if info.get("expiration_date"):
-            lines.append(f"过期时间 '{info['expiration_date']}'")
+            lines.append(f"到期：{info['expiration_date']}")
         if info.get("domain_days_left") is not None:
-            lines.append(f"域名有效期 '{format_days(info['domain_days_left'])}'")
+            lines.append(f"有效期：{format_days(info['domain_days_left'])}")
         if info.get("updated_date"):
-            lines.append(f"最近更新 '{info['updated_date']}'")
+            lines.append(f"最近更新：{info['updated_date']}")
         ssl_info = info.get("ssl") or {}
         if ssl_info.get("days_left") is not None:
-            lines.append(f"证书剩余 '{format_days(ssl_info['days_left'])}'")
+            lines.append(f"证书剩余：{format_days(ssl_info['days_left'])}")
 
         if info.get("reachable"):
-            features = []
             encoding = (info.get("content_encoding") or "").lower()
-            features.append("压缩 " + (encoding or "无"))
-            features.append("移动适配 " + ("有" if info.get("has_viewport") else "无"))
-            features.append(f"安全头 {info.get('security_headers', 0)}/4")
+            marks = [
+                encoding or "未压缩",
+                "移动✓" if info.get("has_viewport") else "移动✗",
+                f"安全头{info.get('security_headers', 0)}/4",
+            ]
+            lines.append("特征：" + " · ".join(marks))
             if info.get("looks_like_error_page"):
-                features.append(f"疑似错误页（{info.get('error_hint') or '内容异常'}）")
+                lines.append(f"⚠️ 疑似错误页：{info.get('error_hint') or '内容异常'}")
             if info.get("blocked"):
-                features.append("人机验证拦截")
+                lines.append("⚠️ 人机验证拦截")
             if info.get("js_shell"):
-                features.append("前端渲染")
-            lines.append("页面特征 '" + " · ".join(features) + "'")
+                lines.append("⚠️ 前端渲染壳")
 
         if not info.get("reachable"):
             lines.append("⚠️ 站点当前无法访问，以上部分信息可能缺失")
@@ -1981,11 +1986,11 @@ class QQProfilePlugin(Star):
                 lines.append("")
             nature = item.get("natureName", "")
             unit_label = "备案主体" if nature == "个人" else "主办单位"
-            lines.append(f"域名: {item.get('domain', 'N/A')}")
-            lines.append(f"{unit_label}: {item.get('unitName', 'N/A')}")
-            lines.append(f"备案号: {item.get('serviceLicence', 'N/A')}")
-            lines.append(f"备案性质: {nature}")
-            lines.append(f"通过时间: {item.get('updateRecordTime', 'N/A')}")
+            lines.append(f"域名：{item.get('domain', 'N/A')}")
+            lines.append(f"{unit_label}：{item.get('unitName', 'N/A')}")
+            lines.append(f"备案号：{item.get('serviceLicence', 'N/A')}")
+            lines.append(f"备案性质：{nature}")
+            lines.append(f"通过时间：{item.get('updateRecordTime', 'N/A')}")
         if len(matched) > 5:
             lines.append(f"\n... 共 {len(matched)} 条，仅展示前 5 条。")
         if dropped:
@@ -2029,22 +2034,24 @@ class QQProfilePlugin(Star):
                 )
             return
 
-        lines = ["📋 SSL 证书信息", "", f"域名: {domain}"]
+        lines = ["📋 SSL 证书信息", f"域名：{domain}"]
         if info.get("issuer"):
-            lines.append(f"颁发者: {info['issuer']}")
+            lines.append(f"颁发者：{info['issuer']}")
         if info.get("not_before"):
-            lines.append(f"生效时间: {info['not_before']}")
+            lines.append(f"生效时间：{info['not_before']}")
         if info.get("expiry"):
-            lines.append(f"到期时间: {info['expiry']}")
+            lines.append(f"到期时间：{info['expiry']}")
         if info.get("days_left") is not None:
-            lines.append(f"剩余天数: {info['days_left']} 天")
+            lines.append(f"剩余天数：{info['days_left']} 天")
         san = info.get("san") or []
         if san:
-            lines.append(f"覆盖域名: {', '.join(san[:5])}")
-            if len(san) > 5:
-                lines.append(f"  ... 共 {len(san)} 个域名")
+            # 行宽有限：只展示第一个，其余用数量带过
+            head = san[0]
+            if len(san) > 1:
+                head += f"（共 {len(san)} 个）"
+            lines.append(f"覆盖域名：{head}")
         if info.get("source"):
-            lines.append(f"数据来源: {info['source']}")
+            lines.append(f"数据来源：{info['source']}")
         if info.get("days_left") is not None and info["days_left"] < 30:
             lines.append("⚠️ 证书即将到期，请及时续签")
 
