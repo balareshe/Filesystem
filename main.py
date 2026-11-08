@@ -9,7 +9,7 @@
     _next_profile_id      自增编号
     _rankings             JSON 数组，评价榜单
 
-v1.6.1 主要变更（相对 v1.4.1）：
+v1.6.2 主要变更（相对 v1.4.1）：
     * 域名归一化（小写、去 www、拒绝 IP 字面量与内网域名），修复独占锁可被绕过
     * 评价体系重做：6 个维度加权 + 动态分母 + 覆盖率收敛，解决"人人 4.8 分"
     * 评价 v1.6.0：维度重构为 6 项可测信号（新增内容与工程），冷启动 3 次采样取中位，
@@ -183,11 +183,6 @@ def ratio_level(ratio: float | None) -> str:
     if ratio >= 0.4:
         return "⚪"
     return "🔴"
-
-
-def bar(ratio: float, width: int = 5) -> str:
-    filled = max(0, min(width, round(ratio * width)))
-    return "█" * filled + "░" * (width - filled)
 
 
 def parse_iso_date(value) -> datetime | None:
@@ -1045,15 +1040,16 @@ class QQProfilePlugin(Star):
 
     @staticmethod
     def _grade_text(score: float) -> str:
+        # 一行放得下为准（手机端折行会破坏观感）
         if score >= 4.5:
-            return "非常优秀的网站，各方面表现出色。"
+            return "非常优秀，各方面都到位。"
         if score >= 3.8:
-            return "整体表现良好，可继续打磨细节。"
+            return "整体良好，可继续打磨。"
         if score >= 3.0:
-            return "中规中矩，部分指标有提升空间。"
+            return "中规中矩，还有提升空间。"
         if score >= 2.0:
-            return "存在明显短板，建议检查域名与证书状态。"
-        return "网站状态较差，多项指标异常，需要排查。"
+            return "存在明显短板。"
+        return "状态较差，需要排查。"
 
     @staticmethod
     def _suggestions(info: dict) -> list[str]:
@@ -1061,34 +1057,85 @@ class QQProfilePlugin(Star):
         tips: list[str] = []
 
         if info.get("looks_like_error_page"):
-            tips.append(
-                f"站点返回 200 但内容像错误页（{info.get('error_hint') or '内容异常'}），"
-                "检查是否未绑定域名或处于维护状态"
-            )
+            tips.append(f"内容像错误页（{info.get('error_hint') or '内容异常'}）")
 
         ssl_info = info.get("ssl") or {}
         ssl_days = ssl_info.get("days_left")
         if ssl_days is not None and ssl_days <= 30:
-            tips.append(f"SSL 证书仅剩 {ssl_days} 天，尽快续签，否则到期后站点会报不安全")
+            tips.append(f"证书 {ssl_days} 天后到期，尽快续签")
         elif info.get("reachable") and not info.get("https_ok"):
-            tips.append("站点未启用 HTTPS 或证书无效，搜索引擎会降权")
+            tips.append("未启用 HTTPS，会被降权")
 
         expiry = info.get("domain_days_left")
         if expiry is not None and expiry <= 90:
-            tips.append(f"域名 {expiry} 天后到期，记得续费，避免过期后被人抢注")
+            tips.append(f"域名 {expiry} 天后到期，记得续费")
 
         if info.get("reachable"):
             if not info.get("has_meta_description"):
-                tips.append("缺少 meta description，搜索结果摘要只能由引擎自行截取")
+                tips.append("缺 meta 描述，影响摘要")
             if not info.get("has_viewport"):
-                tips.append("缺少 viewport 声明，手机上会按桌面宽度整体缩放")
+                tips.append("缺 viewport，手机端会缩放")
             encoding = (info.get("content_encoding") or "").lower()
             if not any(x in encoding for x in ("gzip", "br", "zstd", "deflate")):
-                tips.append("未开启 gzip/brotli 压缩，开启后传输体积通常能减半")
+                tips.append("未开压缩，体积可减半")
             if (info.get("security_headers") or 0) < 2:
-                tips.append("响应头缺少 HSTS / nosniff 等安全头，建议补齐")
+                tips.append("缺 HSTS 等安全响应头")
 
         return tips[:3]
+
+    @staticmethod
+    def _compact_note(key: str, info: dict, note: str) -> str:
+        """给手机端用的一行短说明。
+
+        QQ 手机端是比例字体：长行会被强制折行，折行后原来的缩进和空格对齐全部失效，
+        看起来就是"一团乱"。所以每个维度只保留一条能塞进一行的信息。
+        """
+        if key == "availability":
+            if info.get("looks_like_error_page"):
+                return "疑似错误页"
+            if not info.get("reachable"):
+                return "无法访问"
+            return f"{info.get('status')} · {info.get('latency_ms')}ms"
+
+        if key == "content_engineering":
+            flags = (
+                bool(info.get("title")),
+                bool(info.get("has_meta_description")),
+                bool(info.get("has_viewport")),
+                any(
+                    x in (info.get("content_encoding") or "")
+                    for x in ("gzip", "br", "zstd", "deflate")
+                ),
+                (info.get("security_headers") or 0) >= 3,
+                (info.get("html_bytes") or 0) >= 2000,
+            )
+            return f"{sum(flags)}/6 项达标"
+
+        if key == "ssl":
+            ssl_info = info.get("ssl") or {}
+            days = ssl_info.get("days_left")
+            if days is None:
+                if ssl_info.get("state") in ("timeout", "error"):
+                    return "无数据"
+                return "无可用证书"
+            text = f"剩 {format_days(days)}"
+            if "未覆盖" in note:
+                text += " · 未覆盖"
+            return text
+
+        if key == "domain_expiry":
+            days = info.get("domain_days_left")
+            return f"剩 {format_days(days)}" if days is not None else "无数据"
+
+        if key == "latency":
+            latency = info.get("latency_ms")
+            return f"{latency}ms" if latency is not None else "无数据"
+
+        if key == "domain_age":
+            age = info.get("domain_age_days")
+            return f"注册 {format_days(age)}" if age is not None else "无数据"
+
+        return note.split(" · ")[0].strip()
 
     # ------------------------------------------------------------------ #
     # 榜单
@@ -1177,21 +1224,21 @@ class QQProfilePlugin(Star):
         )
 
     @staticmethod
-    def _describe_delta(previous: dict, score: float) -> str | None:
-        """把「和上次比」翻译成人话。"""
+    def _describe_delta(previous: dict, score: float) -> str:
+        """把「和上次比」压成一行：手机端一行放不下「4.5 → 4.8」这些括号说明。"""
         old = float(previous.get("score", 0))
         change = round(score - old, 1)
         if abs(change) < 0.05:
-            head = f"与上次持平（{old}/5.0）"
+            head = "与上次持平"
         elif change > 0:
-            head = f"较上次 ↑{change}（{old} → {score}）"
+            head = f"较上次 ↑{change}"
         else:
-            head = f"较上次 ↓{abs(change)}（{old} → {score}）"
+            head = f"较上次 ↓{abs(change)}"
 
         stamp = parse_iso_datetime(previous.get("t", ""))
         if stamp:
             days = (datetime.now(timezone.utc) - stamp).days
-            head += " · " + ("刚刚" if days <= 0 else f"{days} 天前")
+            head += " · " + ("刚刚" if days <= 0 else f"{days}天前")
         return head
 
     # ------------------------------------------------------------------ #
@@ -1200,22 +1247,30 @@ class QQProfilePlugin(Star):
 
     @filter.command("hda")
     async def help_command(self, event: AstrMessageEvent):
-        """显示所有命令的说明。"""
+        """显示所有命令的说明（按功能分组，不做空格对齐）。"""
         yield event.plain_result(
-            "📋 用户档案系统 - 命令列表\n\n"
-            "/绑定账号        在群内创建档案\n"
-            "/查询档案        查询档案（白名单管理员可 @ 查他人）\n"
-            "/绑定网站 域名        智能识别网站标题，类型默认「博客」\n"
-            "/绑定网站 名称 类型 域名  手动指定\n"
-            "/更新网站 名称 类型 域名  更新站点信息\n"
-            "/解绑网站        解绑网站，档案保留\n"
-            "/查询域名 [域名]   WHOIS / 存活 / 延迟 / 归属地\n"
-            "/查询备案 [域名]   ICP 备案信息\n"
-            "/查询证书 [域名]   SSL 证书信息\n"
-            "/评价            六维加权评分（5 分制）\n"
-            "/排行            评价榜 TOP12\n"
-            "/删除档案 @用户   删除档案（仅白名单管理员）\n\n"
-            "网站类型：" + "、".join(SITE_TYPES)
+            "📋 用户档案系统\n\n"
+            "【档案】\n"
+            "/绑定账号 — 群内创建档案\n"
+            "/查询档案 — 查看档案\n"
+            "/删除档案 @某人 — 仅管理员\n\n"
+            "【网站】\n"
+            "/绑定网站 域名\n"
+            "　自动识别标题，类型默认博客\n"
+            "/绑定网站 名称 类型 域名\n"
+            "/更新网站 名称 类型 域名\n"
+            "/解绑网站 — 档案保留\n\n"
+            "【查询】\n"
+            "/查询域名 [域名]\n"
+            "/查询备案 [域名]\n"
+            "/查询证书 [域名] — 免密钥\n\n"
+            "【评分】\n"
+            "/评价 — 六维评分\n"
+            "/排行 — TOP12\n\n"
+            "网站类型：" + "、".join(SITE_TYPES[:3]) + "\n"
+            + "、".join(SITE_TYPES[3:]) + "\n"
+            "管理员：@他人查档案 / 删档案\n"
+            "权限只认 admin_ids 白名单"
         )
 
     # ------------------------------------------------------------------ #
@@ -1851,28 +1906,25 @@ class QQProfilePlugin(Star):
         half = 1 if score - full >= 0.3 else 0
         stars = "⭐" * full + ("✨" if half else "") + "☆" * max(0, 5 - full - half)
 
-        header = f"{stars} {score}/5.0    数据覆盖 {int(coverage * 100)}%"
-        if previous:
-            delta = self._describe_delta(previous, score)
-            if delta:
-                header += f"    {delta}"
-        else:
-            header += "    首次评价，已记录基线"
-
+        # 手机端排版：每行一条信息，不依赖空格对齐，不画进度条
         lines = [
             f"📊 网站评价 · {site.get('name', domain)}",
-            header,
-            "",
+            f"{stars} {score}/5.0",
+            f"数据覆盖 {int(coverage * 100)}%",
         ]
+        if previous:
+            lines.append(self._describe_delta(previous, score))
+        else:
+            lines.append("首次评价，已记录基线")
+        lines.append("")
+
         weak: list[str] = []
-        for _key, label, weight, ratio, note in rows:
+        for key, label, weight, ratio, note in rows:
+            short = self._compact_note(key, info, note)
             if ratio is None:
-                lines.append(f"➖ {label} {weight}%  {'░' * 5}  无数据 · {note}")
+                lines.append(f"➖ {label} {weight}% · {short}")
                 continue
-            lines.append(
-                f"{ratio_level(ratio)} {label} {weight}%  "
-                f"{bar(ratio)}  {note}"
-            )
+            lines.append(f"{ratio_level(ratio)} {label} {weight}% · {short}")
             if ratio < 0.5:
                 weak.append(label)
 
@@ -1884,16 +1936,15 @@ class QQProfilePlugin(Star):
         tips = self._suggestions(info)
         if tips:
             lines.append("")
-            lines.append("建议：")
+            lines.append("建议")
             for index, tip in enumerate(tips, 1):
                 lines.append(f"{index}. {tip}")
 
         if coverage < 0.75:
             lines.append("")
-            lines.append(
-                f"注：仅取到 {int(coverage * 100)}% 的指标，分数已按覆盖率向 3.0 收敛，"
-                "配置 WHOIS 密钥可获得更准确的评分。"
-            )
+            lines.append(f"数据只覆盖 {int(coverage * 100)}%")
+            lines.append("分数已按覆盖率向 3.0 收敛")
+            lines.append("配 WHOIS 密钥可更准")
 
         yield event.plain_result("\n".join(lines))
         await self._save_ranking(domain, site.get("name", domain), score, coverage)
