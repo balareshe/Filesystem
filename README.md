@@ -4,7 +4,7 @@ AstrBot 插件 — 在 QQ 内管理用户档案，支持 **全局统一存储、
 
 📦 GitHub：https://github.com/balareshe/Filesystem
 
-当前版本：**1.6.3**
+当前版本：**1.6.4**
 
 ## 功能
 
@@ -77,7 +77,21 @@ IP '1.2.3.4'
 结果缓存 10 分钟，避免同一域名被反复探测触发对方限流。
 
 ### 智能模式
+
 `/绑定网站 域名` 支持智能识别：自动抓取网站标题作为网站名称、类型默认「博客」。识别失败时按提示改用手动模式。
+
+### 抓取健壮性（v1.6.4）
+
+`/绑定网站 域名` 的智能模式要抓首页标题，踩过三个坑，现已都修掉：
+
+| 坑 | 现象 | 修法 |
+|---|---|---|
+| 显式声明 `br` / `zstd` 但没装解码器 | 服务器回 brotli/zstd 时 aiohttp 直接抛 `Can not decode content-encoding`，整次探测失败 | 不再手写 `Accept-Encoding`，让 aiohttp 按自身能力协商 |
+| `StreamReader.read(n)` 提前返回 | chunked 响应上只拿到 **8192 字节**就停，`<title>` 在后面的站永远读不到 | 改用 `iter_chunked` 自己累积，读到 `</head>` 或上限为止 |
+| 标题只认 `<title>` | 前端渲染的站（Nuxt/Next）`<title>` 可能很靠后或干脆没有 | 依次兜底 `<title>` → `og:title` → `twitter:title` → `og:site_name` |
+| apex 只有前端壳 | `yadelei.top` 返回的是骨架页，`www.yadelei.top` 才有预渲染内容 | apex 抓不到标题时，自动用 `www.` 再试一次 |
+
+实测（`/绑定网站 www.yadelei.top`）：修复前直接报「无法自动获取网站名称」，修复后抓到 `烤鸭の博客`。
 
 ### 域名规则（重要）
 为安全起见，域名会先做归一化与校验：
@@ -256,6 +270,15 @@ IP '1.2.3.4'
 - QQ（aiocqhttp）
 
 ## 更新日志
+
+### v1.6.4
+- **修复 `/绑定网站` 抓不到标题**：根因有两个，都在探测层
+  - 手写 `Accept-Encoding: gzip, deflate, br, zstd` 但环境没有 brotli/zstd 解码器 → 服务器回 `br`/`zstd` 时 aiohttp 抛错，整次探测失败
+  - `resp.content.read(400000)` 在 chunked 响应上只返回 **8192 字节**，`<title>` 靠后的站点永远读不到
+- 读 body 改为 `iter_chunked` 累积到 `</head>` 或 512KB 上限
+- 标题兜底顺序：`<title>` → `og:title` → `twitter:title` → `og:site_name`
+- apex 抓不到标题时自动重试 `www.` 前缀
+- 抓不到标题时的提示补充「可能是前端渲染或有人机验证」
 
 ### v1.6.3
 - **SSL 证书**：剩余 ≥ 30 天（一个月）即算合格，比例由 0.6 提到 0.8，显示从 ⚪ 变成 ✅；续签提醒改为「少于 30 天」才触发

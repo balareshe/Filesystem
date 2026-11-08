@@ -9,7 +9,7 @@
     _next_profile_id      自增编号
     _rankings             JSON 数组，评价榜单
 
-v1.6.3 主要变更（相对 v1.4.1）：
+v1.6.4 主要变更（相对 v1.4.1）：
     * 域名归一化（小写、去 www、拒绝 IP 字面量与内网域名），修复独占锁可被绕过
     * 评价体系重做：6 个维度加权 + 动态分母 + 覆盖率收敛，解决"人人 4.8 分"
     * 评价 v1.6.0：维度重构为 6 项可测信号（新增内容与工程），冷启动 3 次采样取中位，
@@ -57,7 +57,7 @@ UA = (
 CACHE_TTL = 600          # 域名探测结果缓存秒数
 CACHE_MAX = 256          # 缓存条目上限
 HTTP_SAMPLES = 3         # 响应速度采样次数（取中位数，单次测量抖动太大）
-BODY_READ_LIMIT = 100_000  # 每次采样读取的字节上限（三次必须一致，否则测速失真）
+BODY_READ_LIMIT = 512_000  # 单次采样读取的字节上限（三次必须一致，否则测速失真）
 HISTORY_MIN_GAP = 3600   # 两次历史记录的最小间隔（秒），防止连点刷榜把趋势冲掉
 
 # 评价维度：(内部键, 展示名, 权重)。权重合计 100。
@@ -160,18 +160,33 @@ def format_days(days: int | None) -> str:
 
 
 def extract_title(html_text: str) -> str | None:
-    """从 HTML 里抠 <title>，解实体（&#8211; 之类），并去掉「站点名 – 副标题」的尾巴。"""
-    match = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL)
-    if not match:
-        return None
-    # 实体不解码的话会得到 "摆烂的小站 &#8211; balareshe" 这种脏标题
-    title = _html.unescape(match.group(1))
-    title = re.sub(r"\s+", " ", title).strip()
-    for sep in (" - ", " – ", " — ", " | ", " :: ", " » ", "_", "－"):
-        if sep in title:
-            title = title.split(sep)[0].strip()
-            break
-    return title or None
+    """从 HTML 里抠标题，解实体（&#8211; 之类），并去掉「站点名 – 副标题」的尾巴。
+
+    依次尝试 <title> → og:title → twitter:title → og:site_name，
+    因为有些站（Nuxt/Next 等 SSR 壳）的 <title> 出现在文件很靠后的位置。
+    """
+    candidates = [
+        r"<title[^>]*>(.*?)</title>",
+        r'<meta[^>]+property\s*=\s*["\']og:title["\'][^>]*content\s*=\s*["\']([^"\']*)',
+        r'<meta[^>]+content\s*=\s*["\']([^"\']*)["\'][^>]*property\s*=\s*["\']og:title["\']',
+        r'<meta[^>]+name\s*=\s*["\']twitter:title["\'][^>]*content\s*=\s*["\']([^"\']*)',
+        r'<meta[^>]+property\s*=\s*["\']og:site_name["\'][^>]*content\s*=\s*["\']([^"\']*)',
+    ]
+    for pattern in candidates:
+        match = re.search(pattern, html_text, re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        title = _html.unescape(match.group(1))
+        title = re.sub(r"\s+", " ", title).strip()
+        if not title:
+            continue
+        for sep in (" - ", " – ", " — ", " | ", " :: ", " » ", "_", "－"):
+            if sep in title:
+                title = title.split(sep)[0].strip()
+                break
+        if title:
+            return title
+    return None
 
 
 def ratio_level(ratio: float | None) -> str:
@@ -452,7 +467,26 @@ class QQProfilePlugin(Star):
             public.append(str(addr))
         return public[0] if public else None
 
-    async def _probe_http(self, domain: str) -> dict:
+    async def _read_page(self, resp, limit: int) -> bytes:
+        """读响应体，直到 </head> 或字节上限。
+
+        不能用 resp.content.read(n)：实测在 chunked/gzip 响应上它会「凑够首个
+        数据块就返回」，只拿到 8192 字节，导致 <title> 在后面的站点永远抓不到。
+        用 iter_chunked 自己累积，才能拿到完整的 <head>。
+        """
+        buf = bytearray()
+        try:
+            async for chunk in resp.content.iter_chunked(65536):
+                buf.extend(chunk)
+                if len(buf) >= limit:
+                    break
+                if b"</head>" in buf[-4096:].lower():
+                    break
+        except Exception as exc:
+            logger.debug(f"[qq_profile] 读取响应体中断（已收 {len(buf)}B）: {exc!r}")
+        return bytes(buf[:limit])
+
+    async def _probe_http(self, domain: str, allow_www_fallback: bool = True) -> dict:
         """抓 HTTP 状态、延迟中位数、Server 头、页面特征与安全响应头。
 
         除状态码外还采集这些「真实」信号，用于后续打分：
@@ -470,7 +504,13 @@ class QQProfilePlugin(Star):
             "has_meta_description": False, "has_viewport": False,
             "security_headers": 0, "looks_like_error_page": False, "error_hint": None,
         }
-        headers = {"User-Agent": UA, "Accept-Encoding": "gzip, deflate, br, zstd"}
+        # 不要显式声明 br/zstd：aiohttp 没装对应解码器时会直接抛
+        # 「Can not decode content-encoding」，整次探测失败。让它按自身能力协商。
+        headers = {
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
 
         for scheme in ("https", "http"):
             if result["reachable"]:
@@ -487,9 +527,9 @@ class QQProfilePlugin(Star):
                         started = time.perf_counter()
                         async with session.get(url, allow_redirects=True) as resp:
                             ttfb = int((time.perf_counter() - started) * 1000)
-                            # 三次采样读同样多的字节，否则「读 4KB 就断开」会比
-                            # 「读完 300KB」快，取中位时把偏快的两次选出来，测量失真
-                            raw = await resp.content.read(BODY_READ_LIMIT)
+                            # 三次采样用同样的读法，否则「读 4KB 就断开」比
+                            # 「读到 </head>」快，取中位时会把偏快的两次选出来
+                            raw = await self._read_page(resp, BODY_READ_LIMIT)
                             elapsed = int((time.perf_counter() - started) * 1000)
                             if index == 0:
                                 html = raw.decode("utf-8", "ignore")
@@ -529,6 +569,23 @@ class QQProfilePlugin(Star):
                 ordered = sorted(samples)
                 result["samples"] = samples
                 result["latency_ms"] = ordered[len(ordered) // 2]
+
+        # 兜底：apex 首页有时只是前端壳（没有标题），但 www 上返回的是预渲染页面。
+        # 只在「已经能访问但没抓到标题」时才多打一次，避免拖慢正常站点。
+        if (
+            allow_www_fallback
+            and result["reachable"]
+            and not result["title"]
+            and not domain.startswith("www.")
+        ):
+            alt = await self._probe_http(f"www.{domain}", allow_www_fallback=False)
+            if alt.get("title"):
+                logger.info(f"[qq_profile] {domain} 首页无标题，已改用 www.{domain} 取到")
+                result["title"] = alt["title"]
+                result["has_meta_description"] = (
+                    result["has_meta_description"] or alt["has_meta_description"]
+                )
+                result["has_viewport"] = result["has_viewport"] or alt["has_viewport"]
         return result
 
     async def _fetch_geo(self, ip: str) -> str | None:
@@ -1453,7 +1510,7 @@ class QQProfilePlugin(Star):
             name = info.get("title")
             if not name:
                 yield event.plain_result(
-                    "❌ 无法自动获取网站名称，请手动指定：\n"
+                    "❌ 无法自动获取网站名称（站点可能是前端渲染或有人机验证），请手动指定：\n"
                     "/绑定网站 网站名称 网站类型 域名\n\n"
                     "示例：/绑定网站 我的站点 博客 example.com"
                 )
