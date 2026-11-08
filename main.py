@@ -9,7 +9,7 @@
     _next_profile_id      自增编号
     _rankings             JSON 数组，评价榜单
 
-v1.6.5 主要变更（相对 v1.4.1）：
+v1.7.0 主要变更（相对 v1.4.1）：
     * 域名归一化（小写、去 www、拒绝 IP 字面量与内网域名），修复独占锁可被绕过
     * 评价体系重做：6 个维度加权 + 动态分母 + 覆盖率收敛，解决"人人 4.8 分"
     * 评价 v1.6.0：维度重构为 6 项可测信号（新增内容与工程），冷启动 3 次采样取中位，
@@ -114,6 +114,16 @@ JS_SHELL_MARKERS = (
 
 # 标题兜底：很多站点首页抓不到标题，但 RSS/Atom 里有
 FEED_PATHS = ("/rss.xml", "/feed.xml", "/atom.xml", "/feed")
+
+# 各维度「拿满分」要满足什么，用于「距满分」提示
+GAP_HINTS = {
+    "availability": "2xx+HTTPS",
+    "content_engineering": "6 项全中",
+    "ssl": "证书≥1年",
+    "domain_expiry": "域名≥2年",
+    "latency": "响应≤400ms",
+    "domain_age": "域名≥5年",
+}
 
 
 
@@ -1219,9 +1229,9 @@ class QQProfilePlugin(Star):
 
     @staticmethod
     def _final_score(rows) -> tuple[float, float]:
-        """加权平均 + 覆盖率收敛，返回 (5 分制得分, 数据覆盖率 0~1)。
+        """加权平均 + 覆盖率收敛，返回 (百分制得分 0~100, 数据覆盖率 0~1)。
 
-        覆盖率低时把分数往 3.0 拉，避免"只测到可用性就 5.0 分"的假高分。
+        覆盖率低时把分数往 60 分拉，避免"只测到可用性就拿 100 分"的假高分。
         """
         got_weight = sum(w for _, _, w, ratio, _ in rows if ratio is not None)
         if got_weight == 0:
@@ -1230,18 +1240,18 @@ class QQProfilePlugin(Star):
         raw = weighted / got_weight
         coverage = got_weight / TOTAL_WEIGHT
         final = raw * coverage + 0.6 * (1 - coverage)
-        return round(min(5.0, final * 5), 1), round(coverage, 2)
+        return round(min(1.0, final) * 100, 1), round(coverage, 2)
 
     @staticmethod
     def _grade_text(score: float) -> str:
         # 一行放得下为准（手机端折行会破坏观感）
-        if score >= 4.5:
+        if score >= 90:
             return "非常优秀，各方面都到位。"
-        if score >= 3.8:
+        if score >= 76:
             return "整体良好，可继续打磨。"
-        if score >= 3.0:
+        if score >= 60:
             return "中规中矩，还有提升空间。"
-        if score >= 2.0:
+        if score >= 40:
             return "存在明显短板。"
         return "状态较差，需要排查。"
 
@@ -1316,14 +1326,14 @@ class QQProfilePlugin(Star):
                 if ssl_info.get("state") in ("timeout", "error"):
                     return "无数据"
                 return "无可用证书"
-            text = f"剩 {format_days(days)}"
+            text = format_days(days)
             if "未覆盖" in note:
                 text += " · 未覆盖"
             return text
 
         if key == "domain_expiry":
             days = info.get("domain_days_left")
-            return f"剩 {format_days(days)}" if days is not None else "无数据"
+            return format_days(days) if days is not None else "无数据"
 
         if key == "latency":
             latency = info.get("latency_ms")
@@ -1331,7 +1341,7 @@ class QQProfilePlugin(Star):
 
         if key == "domain_age":
             age = info.get("domain_age_days")
-            return f"注册 {format_days(age)}" if age is not None else "无数据"
+            return format_days(age) if age is not None else "无数据"
 
         return note.split(" · ")[0].strip()
 
@@ -1347,10 +1357,16 @@ class QQProfilePlugin(Star):
             except ValueError:
                 logger.warning("[qq_profile] 排行榜数据损坏，已重置")
                 return []
-            return data if isinstance(data, list) else []
-        if isinstance(raw, list):
-            return raw
-        return []
+            data = data if isinstance(data, list) else []
+        elif isinstance(raw, list):
+            data = raw
+        else:
+            return []
+        # 老记录的 score 是 5 分制，这里统一换成百分制
+        for record in data:
+            if isinstance(record, dict):
+                record["score"] = QQProfilePlugin._normalize_score(record.get("score", 0))
+        return data
 
     async def _save_ranking(self, domain: str, name: str, score: float, coverage: float) -> None:
         rankings = await self._get_rankings()
@@ -1364,9 +1380,9 @@ class QQProfilePlugin(Star):
                 {"domain": domain, "name": name, "score": score,
                  "coverage": coverage, "time": now}
             )
-        perfect = [r for r in rankings if r.get("score", 0) >= 5.0]
+        perfect = [r for r in rankings if r.get("score", 0) >= 99.95]
         perfect.sort(key=lambda r: r.get("time", ""))
-        others = [r for r in rankings if r.get("score", 0) < 5.0]
+        others = [r for r in rankings if r.get("score", 0) < 99.95]
         others.sort(key=lambda r: (-r.get("score", 0), r.get("time", "")))
         await self.put_kv_data(
             "_rankings", json.dumps(perfect[-5:] + others, ensure_ascii=False)
@@ -1377,6 +1393,19 @@ class QQProfilePlugin(Star):
     # ------------------------------------------------------------------ #
 
     HISTORY_KEEP = 10
+
+    @staticmethod
+    def _normalize_score(value) -> float:
+        """兼容旧数据：v1.6.x 存的是 5 分制，v1.7.0 起是百分制。
+
+        5 分制的取值范围是 0~5，百分制不会低于 5 分（除非站点彻底挂掉），
+        所以 <= 5 的一律按旧制 ×20 换算。
+        """
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return score * 20 if score <= 5.0 else score
 
     async def _load_history(self, domain: str) -> list[dict]:
         raw = await self.get_kv_data(f"_history_{domain}", None)
@@ -1396,7 +1425,7 @@ class QQProfilePlugin(Star):
         if history:
             last = history[-1]
             stamp = parse_iso_datetime(last.get("t", ""))
-            unchanged = abs(float(last.get("score", 0)) - score) < 0.05
+            unchanged = abs(self._normalize_score(last.get("score", 0)) - score) < 0.5
             if stamp and unchanged:
                 gap = (datetime.now(timezone.utc) - stamp).total_seconds()
                 # 连点 /评价 会让历史堆满"持平"记录，把真正的趋势冲掉
@@ -1424,14 +1453,14 @@ class QQProfilePlugin(Star):
     @staticmethod
     def _describe_delta(previous: dict, score: float) -> str:
         """把「和上次比」压成一行：手机端一行放不下「4.5 → 4.8」这些括号说明。"""
-        old = float(previous.get("score", 0))
+        old = QQProfilePlugin._normalize_score(previous.get("score", 0))
         change = round(score - old, 1)
-        if abs(change) < 0.05:
+        if abs(change) < 0.5:
             head = "与上次持平"
         elif change > 0:
-            head = f"较上次 ↑{change}"
+            head = f"较上次 ↑{change:g}"
         else:
-            head = f"较上次 ↓{abs(change)}"
+            head = f"较上次 ↓{abs(change):g}"
 
         stamp = parse_iso_datetime(previous.get("t", ""))
         if stamp:
@@ -2097,7 +2126,7 @@ class QQProfilePlugin(Star):
         if not info.get("reachable"):
             yield event.plain_result(
                 f"📊 网站评价 · {site.get('name', domain)}\n"
-                "⚫ 0.0/5.0\n\n"
+                "⚫ 0/100\n\n"
                 "❌ 站点当前无法访问（DNS 解析正常但 HTTP 无响应）。\n"
                 "本次结果不计入排行榜，请稍后重试。"
             )
@@ -2113,14 +2142,16 @@ class QQProfilePlugin(Star):
         history = await self._load_history(domain)
         previous = history[-1] if history else None
 
-        full = int(score)
-        half = 1 if score - full >= 0.3 else 0
-        stars = "⭐" * full + ("✨" if half else "") + "☆" * max(0, 5 - full - half)
+        # 百分制 → 星级（满分 100，每星 20 分）
+        full_stars = int(score // 20)
+        frac = score / 20 - full_stars
+        half = 1 if frac >= 0.3 else 0
+        stars = "⭐" * full_stars + ("✨" if half else "") + "☆" * max(0, 5 - full_stars - half)
 
         # 手机端排版：每行一条信息，不依赖空格对齐，不画进度条
         lines = [
             f"📊 网站评价 · {site.get('name', domain)}",
-            f"{stars} {score}/5.0",
+            f"{stars} {score:g}/100",
             f"数据覆盖 {int(coverage * 100)}%",
         ]
         if previous:
@@ -2130,17 +2161,26 @@ class QQProfilePlugin(Star):
         lines.append("")
 
         weak: list[str] = []
+        gaps: list[str] = []
         for key, label, weight, ratio, note in rows:
             short = self._compact_note(key, info, note)
             if ratio is None:
                 lines.append(f"➖ {label} {weight}% · {short}")
                 continue
+            # 没拿满的维度标出百分比，一眼能看出分数差在哪
+            if ratio < 0.999:
+                short += f"（{round(ratio * 100)}%）"
+                hint = GAP_HINTS.get(key)
+                if hint:
+                    gaps.append(hint)
             lines.append(f"{ratio_level(ratio)} {label} {weight}% · {short}")
             if ratio < 0.5:
                 weak.append(label)
 
         lines.append("")
         lines.append(self._grade_text(score))
+        if gaps:
+            lines.append("距满分：" + "、".join(gaps[:2]))
         if weak:
             lines.append("待改进：" + "、".join(weak))
 
@@ -2154,7 +2194,7 @@ class QQProfilePlugin(Star):
         if coverage < 0.75:
             lines.append("")
             lines.append(f"数据只覆盖 {int(coverage * 100)}%")
-            lines.append("分数已按覆盖率向 3.0 收敛")
+            lines.append("分数已按覆盖率向 60 分收敛")
             lines.append("配 WHOIS 密钥可更准")
 
         yield event.plain_result("\n".join(lines))
@@ -2173,9 +2213,9 @@ class QQProfilePlugin(Star):
             yield event.plain_result("📊 暂无排行榜数据，快去用 /评价 打分吧！")
             return
 
-        perfect = [r for r in rankings if r.get("score", 0) >= 5.0]
+        perfect = [r for r in rankings if r.get("score", 0) >= 99.95]
         perfect.sort(key=lambda r: r.get("time", ""))
-        others = [r for r in rankings if r.get("score", 0) < 5.0]
+        others = [r for r in rankings if r.get("score", 0) < 99.95]
         others.sort(key=lambda r: (-r.get("score", 0), r.get("time", "")))
         merged = (perfect[-5:] + others)[:12]
 
@@ -2183,7 +2223,7 @@ class QQProfilePlugin(Star):
         for index, record in enumerate(merged):
             medal = ["🥇", "🥈", "🥉"][index] if index < 3 else f"{index + 1}."
             lines.append(
-                f"{medal} {float(record.get('score', 0)):.1f}/5.0  "
+                f"{medal} {float(record.get('score', 0)):.0f}/100  "
                 f"{record.get('domain', '')}"
             )
         yield event.plain_result("\n".join(lines))
