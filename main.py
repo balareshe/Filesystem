@@ -9,7 +9,7 @@
     _next_profile_id      自增编号
     _rankings             JSON 数组，评价榜单
 
-v1.6.0 主要变更（相对 v1.4.1）：
+v1.6.1 主要变更（相对 v1.4.1）：
     * 域名归一化（小写、去 www、拒绝 IP 字面量与内网域名），修复独占锁可被绕过
     * 评价体系重做：6 个维度加权 + 动态分母 + 覆盖率收敛，解决"人人 4.8 分"
     * 评价 v1.6.0：维度重构为 6 项可测信号（新增内容与工程），冷启动 3 次采样取中位，
@@ -57,6 +57,8 @@ UA = (
 CACHE_TTL = 600          # 域名探测结果缓存秒数
 CACHE_MAX = 256          # 缓存条目上限
 HTTP_SAMPLES = 3         # 响应速度采样次数（取中位数，单次测量抖动太大）
+BODY_READ_LIMIT = 100_000  # 每次采样读取的字节上限（三次必须一致，否则测速失真）
+HISTORY_MIN_GAP = 3600   # 两次历史记录的最小间隔（秒），防止连点刷榜把趋势冲掉
 
 # 评价维度：(内部键, 展示名, 权重)。权重合计 100。
 # 域名年龄只占 5 分：新域名不该被一棍子打死，它也不是"网站质量"的主要因素。
@@ -203,6 +205,24 @@ def parse_iso_date(value) -> datetime | None:
         )
     except ValueError:
         return None
+
+
+def parse_iso_datetime(value) -> datetime | None:
+    """精确到秒地解析 ISO 时间（含时区），解析不了再退回只到日期。
+
+    parse_iso_date 会把时间截断到当天零点，用它算「距上次多少秒」会得到
+    「距当天零点多少秒」，判断"两次评价间隔是否过短"时会永远判错。
+    """
+    if not value:
+        return None
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return parse_iso_date(value)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp
 
 
 # --------------------------------------------------------------------------- #
@@ -471,10 +491,12 @@ class QQProfilePlugin(Star):
                     ) as session:
                         started = time.perf_counter()
                         async with session.get(url, allow_redirects=True) as resp:
+                            ttfb = int((time.perf_counter() - started) * 1000)
+                            # 三次采样读同样多的字节，否则「读 4KB 就断开」会比
+                            # 「读完 300KB」快，取中位时把偏快的两次选出来，测量失真
+                            raw = await resp.content.read(BODY_READ_LIMIT)
+                            elapsed = int((time.perf_counter() - started) * 1000)
                             if index == 0:
-                                ttfb = int((time.perf_counter() - started) * 1000)
-                                raw = await resp.content.read(300_000)
-                                elapsed = int((time.perf_counter() - started) * 1000)
                                 html = raw.decode("utf-8", "ignore")
                                 title = extract_title(html)
                                 error_page, hint = looks_like_error_page(
@@ -502,12 +524,7 @@ class QQProfilePlugin(Star):
                                 )
                                 if scheme == "https" and 200 <= resp.status < 400:
                                     result["https_ok"] = True
-                                samples.append(elapsed)
-                            else:
-                                await resp.content.read(4096)
-                                samples.append(
-                                    int((time.perf_counter() - started) * 1000)
-                                )
+                            samples.append(elapsed)
                 except Exception as exc:
                     logger.debug(
                         f"[qq_profile] {scheme}://{domain} 第 {index + 1} 次采样失败: {exc!r}"
@@ -1039,7 +1056,7 @@ class QQProfilePlugin(Star):
         return "网站状态较差，多项指标异常，需要排查。"
 
     @staticmethod
-    def _suggestions(rows, info: dict) -> list[str]:
+    def _suggestions(info: dict) -> list[str]:
         """把失分项翻译成「具体能做什么」，最多给 3 条，避免刷屏。"""
         tips: list[str] = []
 
@@ -1131,6 +1148,18 @@ class QQProfilePlugin(Star):
         self, domain: str, score: float, coverage: float, rows
     ) -> None:
         history = await self._load_history(domain)
+        if history:
+            last = history[-1]
+            stamp = parse_iso_datetime(last.get("t", ""))
+            unchanged = abs(float(last.get("score", 0)) - score) < 0.05
+            if stamp and unchanged:
+                gap = (datetime.now(timezone.utc) - stamp).total_seconds()
+                # 连点 /评价 会让历史堆满"持平"记录，把真正的趋势冲掉
+                if gap < HISTORY_MIN_GAP:
+                    logger.debug(
+                        f"[qq_profile] {domain} 评分未变化且间隔 {int(gap)}s，跳过写历史"
+                    )
+                    return
         dims = {
             key: round(ratio, 2)
             for key, _label, _w, ratio, _note in rows
@@ -1159,7 +1188,7 @@ class QQProfilePlugin(Star):
         else:
             head = f"较上次 ↓{abs(change)}（{old} → {score}）"
 
-        stamp = parse_iso_date(previous.get("t", ""))
+        stamp = parse_iso_datetime(previous.get("t", ""))
         if stamp:
             days = (datetime.now(timezone.utc) - stamp).days
             head += " · " + ("刚刚" if days <= 0 else f"{days} 天前")
@@ -1852,7 +1881,7 @@ class QQProfilePlugin(Star):
         if weak:
             lines.append("待改进：" + "、".join(weak))
 
-        tips = self._suggestions(rows, info)
+        tips = self._suggestions(info)
         if tips:
             lines.append("")
             lines.append("建议：")
