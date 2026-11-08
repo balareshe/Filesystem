@@ -9,7 +9,7 @@
     _next_profile_id      自增编号
     _rankings             JSON 数组，评价榜单
 
-v1.6.4 主要变更（相对 v1.4.1）：
+v1.6.5 主要变更（相对 v1.4.1）：
     * 域名归一化（小写、去 www、拒绝 IP 字面量与内网域名），修复独占锁可被绕过
     * 评价体系重做：6 个维度加权 + 动态分母 + 覆盖率收敛，解决"人人 4.8 分"
     * 评价 v1.6.0：维度重构为 6 项可测信号（新增内容与工程），冷启动 3 次采样取中位，
@@ -91,6 +91,31 @@ ERROR_PAGE_HINTS = (
 RE_META_DESC = re.compile(r'<meta[^>]+name\s*=\s*["\']description["\']', re.IGNORECASE)
 RE_META_VIEWPORT = re.compile(r'<meta[^>]+name\s*=\s*["\']viewport["\']', re.IGNORECASE)
 
+# 人机验证 / 反爬拦截页的特征（命中就不要把它的内容当成站点内容）
+CHALLENGE_MARKERS = (
+    "just a moment...",
+    "attention required! | cloudflare",
+    "checking your browser",
+    "cf-browser-verification",
+    "_cf_chl_opt",
+    "enable javascript and cookies to continue",
+    "ddos protection by",
+)
+
+# 前端渲染壳的特征：抓不到内容时用来给用户一句人话解释
+JS_SHELL_MARKERS = (
+    "__nuxt__",
+    "__next_data__",
+    "id=\"app\"",
+    "id='app'",
+    "__initial_state__",
+    "window.__nuxt",
+)
+
+# 标题兜底：很多站点首页抓不到标题，但 RSS/Atom 里有
+FEED_PATHS = ("/rss.xml", "/feed.xml", "/atom.xml", "/feed")
+
+
 
 # --------------------------------------------------------------------------- #
 # 纯函数工具
@@ -159,11 +184,52 @@ def format_days(days: int | None) -> str:
     return f"{days}天"
 
 
-def extract_title(html_text: str) -> str | None:
-    """从 HTML 里抠标题，解实体（&#8211; 之类），并去掉「站点名 – 副标题」的尾巴。
+def clean_title(raw: str) -> str | None:
+    """统一清洗标题：解 HTML 实体、压空白、去掉「站点名 – 副标题」的尾巴。"""
+    title = _html.unescape(raw or "")
+    title = re.sub(r"\s+", " ", title).strip()
+    if not title:
+        return None
+    for sep in (" - ", " – ", " — ", " | ", " :: ", " » ", "_", "－"):
+        if sep in title:
+            title = title.split(sep)[0].strip()
+            break
+    return title or None
 
-    依次尝试 <title> → og:title → twitter:title → og:site_name，
-    因为有些站（Nuxt/Next 等 SSR 壳）的 <title> 出现在文件很靠后的位置。
+
+def jsonld_title(node, depth: int = 0) -> str | None:
+    """在 JSON-LD 里找 name/headline。支持 @graph 这类嵌套，但不下钻 author 等字段，
+    否则会把作者名当成站点名。"""
+    if depth > 3:
+        return None
+    if isinstance(node, dict):
+        for key in ("name", "headline"):
+            value = node.get(key)
+            if isinstance(value, str):
+                title = clean_title(value)
+                if title:
+                    return title
+        for key, value in node.items():
+            if key.lower() in ("author", "publisher", "aggregaterating", "image", "logo"):
+                continue
+            found = jsonld_title(value, depth + 1)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = jsonld_title(value, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def extract_title(html_text: str) -> str | None:
+    """按可靠性从高到低依次尝试各种标题来源。
+
+    顺序：<title> → og:title → twitter:title → og:site_name →
+    JSON-LD 的 name/headline → apple-mobile-web-app-title。
+    前面几个都是浏览器和搜索引擎真正使用的，别再退回 <h1>：
+    那玩意经常是 logo 文字（实测某站 <h1> 就是 "yadelei"），拿它当站名是噪声。
     """
     candidates = [
         r"<title[^>]*>(.*?)</title>",
@@ -171,19 +237,25 @@ def extract_title(html_text: str) -> str | None:
         r'<meta[^>]+content\s*=\s*["\']([^"\']*)["\'][^>]*property\s*=\s*["\']og:title["\']',
         r'<meta[^>]+name\s*=\s*["\']twitter:title["\'][^>]*content\s*=\s*["\']([^"\']*)',
         r'<meta[^>]+property\s*=\s*["\']og:site_name["\'][^>]*content\s*=\s*["\']([^"\']*)',
+        r'<meta[^>]+name\s*=\s*["\']apple-mobile-web-app-title["\'][^>]*content\s*=\s*["\']([^"\']*)',
     ]
     for pattern in candidates:
         match = re.search(pattern, html_text, re.IGNORECASE | re.DOTALL)
-        if not match:
+        if match:
+            title = clean_title(match.group(1))
+            if title:
+                return title
+
+    # JSON-LD：很多 SSR/SEO 站点会写 application/ld+json 的 name
+    for block in re.finditer(
+        r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
+        html_text, re.IGNORECASE | re.DOTALL,
+    ):
+        try:
+            data = json.loads(block.group(1))
+        except (ValueError, TypeError):
             continue
-        title = _html.unescape(match.group(1))
-        title = re.sub(r"\s+", " ", title).strip()
-        if not title:
-            continue
-        for sep in (" - ", " – ", " — ", " | ", " :: ", " » ", "_", "－"):
-            if sep in title:
-                title = title.split(sep)[0].strip()
-                break
+        title = jsonld_title(data)
         if title:
             return title
     return None
@@ -503,6 +575,7 @@ class QQProfilePlugin(Star):
             "reachable": False, "content_encoding": "", "html_bytes": 0,
             "has_meta_description": False, "has_viewport": False,
             "security_headers": 0, "looks_like_error_page": False, "error_hint": None,
+            "blocked": False, "js_shell": False,
         }
         # 不要显式声明 br/zstd：aiohttp 没装对应解码器时会直接抛
         # 「Can not decode content-encoding」，整次探测失败。让它按自身能力协商。
@@ -534,6 +607,18 @@ class QQProfilePlugin(Star):
                             if index == 0:
                                 html = raw.decode("utf-8", "ignore")
                                 title = extract_title(html)
+                                lowered = html[:4000].lower()
+                                blocked = bool(
+                                    resp.headers.get("cf-mitigated")
+                                ) or any(m in lowered for m in CHALLENGE_MARKERS)
+                                if blocked:
+                                    # 挑战页/拦截页上的标题不是站点标题
+                                    title = None
+                                js_shell = (
+                                    not title
+                                    and len(raw) < 20_000
+                                    and any(m in html.lower() for m in JS_SHELL_MARKERS)
+                                )
                                 error_page, hint = looks_like_error_page(
                                     resp.status, title, html
                                 )
@@ -556,6 +641,8 @@ class QQProfilePlugin(Star):
                                     ),
                                     looks_like_error_page=error_page,
                                     error_hint=hint,
+                                    blocked=blocked,
+                                    js_shell=js_shell,
                                 )
                                 if scheme == "https" and 200 <= resp.status < 400:
                                     result["https_ok"] = True
@@ -587,6 +674,34 @@ class QQProfilePlugin(Star):
                 )
                 result["has_viewport"] = result["has_viewport"] or alt["has_viewport"]
         return result
+
+    async def _fetch_feed_title(self, domain: str) -> str | None:
+        """首页抓不到标题时的最后一招：翻 RSS / Atom。
+
+        实测：有些站的首页是 JS 壳或只给骨架，但 /rss.xml 里就有干净的
+        <title>站点名</title>。只在确实拿不到标题时调用，最多试 FEED_PATHS 里的几个路径。
+        """
+        headers = {"User-Agent": UA, "Accept": "application/rss+xml,application/xml,*/*;q=0.8"}
+        for path in FEED_PATHS:
+            url = f"https://{domain}{path}"
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=ClientTimeout(total=8), headers=headers
+                ) as session:
+                    async with session.get(url, allow_redirects=True) as resp:
+                        if resp.status != 200:
+                            continue
+                        raw = await self._read_page(resp, 200_000)
+                text = raw.decode("utf-8", "ignore")
+                match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+                if match:
+                    title = clean_title(match.group(1))
+                    if title:
+                        logger.info(f"[qq_profile] {domain} 首页无标题，已从 {path} 取到")
+                        return title
+            except Exception as exc:
+                logger.debug(f"[qq_profile] {url} 读取失败: {exc!r}")
+        return None
 
     async def _fetch_geo(self, ip: str) -> str | None:
         try:
@@ -803,6 +918,8 @@ class QQProfilePlugin(Star):
             "security_headers": 0,
             "looks_like_error_page": False,
             "error_hint": None,
+            "blocked": False,
+            "js_shell": False,
             "registrar": None,
             "creation_date": None,
             "expiration_date": None,
@@ -859,10 +976,19 @@ class QQProfilePlugin(Star):
                 "security_headers": http_result.get("security_headers", 0),
                 "looks_like_error_page": http_result.get("looks_like_error_page", False),
                 "error_hint": http_result.get("error_hint"),
+                "blocked": http_result.get("blocked", False),
+                "js_shell": http_result.get("js_shell", False),
             }
         )
         info["ssl"] = ssl_result or {"days_left": None, "state": "error", "source": None}
         info.update(whois_result)
+
+        # 首页没标题就翻 RSS/Atom（人工验证拦截的除外，那时抓到的都不是本站内容）
+        if info.get("reachable") and not info.get("title") and not info.get("blocked"):
+            feed_title = await self._fetch_feed_title(domain)
+            if feed_title:
+                info["title"] = feed_title
+                info["title_source"] = "feed"
 
         self._cache_put(f"domain:{domain}", info)
         return info
@@ -914,6 +1040,16 @@ class QQProfilePlugin(Star):
         # 2. 内容与工程：6 个可测子项，拿不到的子项不进分母
         if not info.get("reachable"):
             rows.append(("content_engineering", "内容与工程", 25, None, "站点无响应"))
+        elif info.get("blocked"):
+            rows.append((
+                "content_engineering", "内容与工程", 25, None,
+                "人机验证拦截",
+            ))
+        elif info.get("js_shell") and not info.get("title"):
+            rows.append((
+                "content_engineering", "内容与工程", 25, None,
+                "前端渲染壳",
+            ))
         elif info.get("looks_like_error_page"):
             rows.append((
                 "content_engineering", "内容与工程", 25, 0.0,
@@ -1156,6 +1292,10 @@ class QQProfilePlugin(Star):
             return f"{info.get('status')} · {info.get('latency_ms')}ms"
 
         if key == "content_engineering":
+            if info.get("blocked"):
+                return "人机验证拦截"
+            if info.get("js_shell") and not info.get("title"):
+                return "前端渲染壳"
             flags = (
                 bool(info.get("title")),
                 bool(info.get("has_meta_description")),
@@ -1509,10 +1649,19 @@ class QQProfilePlugin(Star):
             info = await self._fetch_domain_info(domain)
             name = info.get("title")
             if not name:
+                if info.get("blocked"):
+                    reason = "站点启用了人机验证（Cloudflare 等），脚本抓不到标题。"
+                elif info.get("js_shell"):
+                    reason = "站点是前端渲染（内容由 JS 生成），脚本抓不到标题。"
+                elif not info.get("reachable"):
+                    reason = "站点当前无法访问，抓不到标题。"
+                else:
+                    reason = "站点首页没有标题，也没有可用的 RSS。"
                 yield event.plain_result(
-                    "❌ 无法自动获取网站名称（站点可能是前端渲染或有人机验证），请手动指定：\n"
+                    f"❌ {reason}\n"
+                    "请手动指定：\n"
                     "/绑定网站 网站名称 网站类型 域名\n\n"
-                    "示例：/绑定网站 我的站点 博客 example.com"
+                    f"示例：/绑定网站 我的站点 博客 {domain}"
                 )
                 return
 
@@ -1717,6 +1866,10 @@ class QQProfilePlugin(Star):
             features.append(f"安全头 {info.get('security_headers', 0)}/4")
             if info.get("looks_like_error_page"):
                 features.append(f"疑似错误页（{info.get('error_hint') or '内容异常'}）")
+            if info.get("blocked"):
+                features.append("人机验证拦截")
+            if info.get("js_shell"):
+                features.append("前端渲染")
             lines.append("页面特征 '" + " · ".join(features) + "'")
 
         if not info.get("reachable"):
