@@ -9,7 +9,7 @@
     _next_profile_id      自增编号
     _rankings             JSON 数组，评价榜单
 
-v1.7.0 主要变更（相对 v1.4.1）：
+v1.7.1 主要变更（相对 v1.4.1）：
     * 域名归一化（小写、去 www、拒绝 IP 字面量与内网域名），修复独占锁可被绕过
     * 评价体系重做：6 个维度加权 + 动态分母 + 覆盖率收敛，解决"人人 4.8 分"
     * 评价 v1.6.0：维度重构为 6 项可测信号（新增内容与工程），冷启动 3 次采样取中位，
@@ -119,10 +119,10 @@ FEED_PATHS = ("/rss.xml", "/feed.xml", "/atom.xml", "/feed")
 GAP_HINTS = {
     "availability": "2xx+HTTPS",
     "content_engineering": "6 项全中",
-    "ssl": "证书≥1年",
+    "ssl": "证书≥90天",
     "domain_expiry": "域名≥2年",
     "latency": "响应≤400ms",
-    "domain_age": "域名≥5年",
+    "domain_age": "域名≥3年",
 }
 
 
@@ -1147,13 +1147,9 @@ class QQProfilePlugin(Star):
         ssl_days = ssl_info.get("days_left")
         ssl_state = ssl_info.get("state", "error")
         if ssl_days is not None:
-            # 判定口径：剩余 ≥ 30 天（一个月）即算「合格」，不再视为短板
-            if ssl_days >= 365:
+            # 判定口径：≥90 天（三个月）即满分；≥30 天（一个月）算合格
+            if ssl_days >= 90:
                 ratio = 1.0
-            elif ssl_days >= 180:
-                ratio = 0.95
-            elif ssl_days >= 90:
-                ratio = 0.85
             elif ssl_days >= 30:
                 ratio = 0.8
             elif ssl_days >= 7:
@@ -1204,15 +1200,13 @@ class QQProfilePlugin(Star):
             suffix = f"（冷启动 {len(samples)} 次中位）" if len(samples) > 1 else ""
             rows.append(("latency", "响应速度", 10, ratio, f"{latency}ms{suffix}"))
 
-        # 6. 域名年龄（权重 5）：注册满一年即算「合格」
+        # 6. 域名年龄（权重 5）：注册满 3 年即满分，满 1 年算合格
         age_days = info.get("domain_age_days")
         if age_days is None:
             rows.append(("domain_age", "域名年龄", 5, None, "未获取注册时间"))
         else:
-            if age_days >= 1825:
+            if age_days >= 1095:
                 ratio = 1.0
-            elif age_days >= 1095:
-                ratio = 0.9
             elif age_days >= 365:
                 ratio = 0.8
             elif age_days >= 180:
